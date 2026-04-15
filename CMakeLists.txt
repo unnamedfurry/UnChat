@@ -3,5 +3,6 @@ project(UnChat C)
 
 set(CMAKE_C_STANDARD 23)
 
-add_executable(client client.c)
+add_executable(client client-old.c
+        client.c)
 add_executable(server server.c)
