@@ -11,6 +11,7 @@
  */
 
 #include "raylib.h"
+#define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,14 +37,15 @@ typedef struct {
 bool loadConfig(Config *cfg) {
     FILE *f = fopen(CONFIG_FILE, "r");
     if (!f) return false;
-    char line[256];
+    char line[512];
     *cfg = (Config){.isFirstUsed = true};
 
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
 
         if (strncmp(line, "isFirstUsed=", 12) == 0) cfg->isFirstUsed=(strstr(line, "=true") != NULL);
-        else if (strncmp(line, "userId=", 7) == 0) cfg->userId=atol(line+7);
+        else if (strncmp(line, "userId=", 7) == 0) cfg->userId=atoll(line+7);
+        // else if (strncmp(line, "userId=", 7) == 0) strtol();
         else if (strncmp(line, "userName=", 9) == 0) strncpy(cfg->userName, line+9, MAX_NAME);
         else if (strncmp(line, "email=", 6) == 0) strncpy(cfg->email, line+6, MAX_EMAIL);
         else if (strncmp(line, "passwordHash=", 13) == 0) {
@@ -62,7 +64,7 @@ bool saveConfig(Config *cfg) {
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return false;
     fprintf(f, "isFirstUsed=%s\n", cfg->isFirstUsed ? "true" : "false");
-    fprintf(f, "userId=%ld\n", cfg->userId);
+    fprintf(f, "userId=%s\n", cfg->userId==0 ? "0000000000" : cfg->userName);
     fprintf(f, "userName=%s\n", cfg->userName);
     fprintf(f, "email=%s\n", cfg->email);
     fprintf(f, "passwordHash=");
@@ -81,8 +83,17 @@ void HashPassword(const char* password, unsigned char* outHash) {
 
 int main(void) {
     InitWindow(1600, 900, "UnChat - BETA 1.0");
+    int codepoints[2048] = {0};
+    int count = 0;
+    for (int i = 32; i < 128; i++) codepoints[count++] = i;
+    for (int i = 0x0400; i <= 0x04FF; i++) codepoints[count++] = i;
     InitAudioDevice();
     SetTargetFPS(60);
+
+    Font font = LoadFontEx("NotoSans-Regular.ttf", 32, codepoints, count);
+    GenTextureMipmaps(&font.texture);
+    SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
+    GuiSetFont(font);
 
     Config config = {0};
     bool loadedConf = loadConfig(&config);
@@ -99,25 +110,26 @@ int main(void) {
         ClearBackground(BLACK);
 
         if (config.isFirstUsed) {
-            DrawText("Добро пожаловать. Пройди настройку профиля:", 100, 50, 40, WHITE);
+            DrawTextEx(font, "Добро пожаловать. Пройди настройку профиля:", (Vector2){100, 50}, 40, 3, WHITE);
             GuiTextBox((Rectangle){100, 150, 400, 40}, config.userName, MAX_NAME, activeField==0);
             GuiTextBox((Rectangle){100, 220, 400, 40}, config.email, MAX_EMAIL, activeField==1);
             GuiTextBox((Rectangle){100, 290, 400, 40}, passwordInput, MAX_PASS, activeField==2);
-            DrawText("Юзернейм", 520, 160, 20, LIGHTGRAY);
-            DrawText("Email", 520, 230, 20, LIGHTGRAY);
-            DrawText("Пароль", 520, 300, 20, LIGHTGRAY);
+            DrawTextEx(font,"Юзернейм", (Vector2){520, 160}, 20, 3, LIGHTGRAY);
+            DrawTextEx(font, "Email", (Vector2){520, 230}, 20, 3, LIGHTGRAY);
+            DrawTextEx(font, "Пароль", (Vector2){520, 300}, 20, 3, LIGHTGRAY);
 
             if (GuiButton((Rectangle){100, 380, 200, 50}, "Сохранить и продолжить")) {
                 HashPassword(passwordInput, config.passwordHash);
                 config.isFirstUsed=false;
                 saveConfig(&config);
             } else {
-                DrawText(TextFormat("Привет, %s", config.userName), 100, 100, 40, WHITE);
+                DrawTextEx(font, TextFormat("Привет, %s", config.userName), (Vector2){100, 100}, 40, 3, WHITE);
             }
         }
 
         EndDrawing();
     }
+    UnloadFont(font);
     CloseAudioDevice();
     CloseWindow();
     return 0;

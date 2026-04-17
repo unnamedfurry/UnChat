@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 4.2)
 project(UnChat C)
 
 set(CMAKE_C_STANDARD 23)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+find_package(raylib 5.0 REQUIRED)
+find_package(libwebsockets REQUIRED)
+find_package(OpenSSL REQUIRED)
 
-add_executable(client client-old.c
-        client.c)
+add_executable(client client.c)
 add_executable(server server.c)
+target_link_libraries(client PRIVATE raylib GL m pthread dl rt X11 websockets OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(server PRIVATE m pthread websockets OpenSSL::SSL OpenSSL::Crypto)
+target_include_directories(client PRIVATE ${CMAKE_SOURCE_DIR}/build_include)
