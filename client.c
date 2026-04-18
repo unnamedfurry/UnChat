@@ -1,25 +1,14 @@
-/*
- *  |         Task          |         Java          |                C               |
- *  ----------------------------------------------------------------------------------
- *  |  Read File            |  new File()           |  fopen()                       |
- *  |  Close File           |  auto                 |  fclose()                      |
- *  |  Read Text            |  Files.readString()   |  fgets(), fread(), getc()      |
- *  |  Write Text           |  Files.writeString()  |  fprintf(). fputs(), fwrite()  |
- *  |  R/W binary           |  FileInputStream      |  fread() / fwrite()            |
- *  |  Check for existence  |  file.exists()        |  access(), stat()              |
- *  |  Get size, time etc.  |  file.length() etc.   |  stat()                        |
- */
-
 #include "raylib.h"
 #define RAYGUI_IMPLEMENTATION
-#include <errno.h>
-
 #include "raygui.h"
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <openssl/sha.h>
+#include "mongoose.h"
 
 #define CONFIG_FILE "conf.txt"
 #define MAX_NAME 23
@@ -28,6 +17,24 @@
 #define MAX_AVATAR 64
 #define MAX_DESC 1024
 #define MAX_MESS 2048
+
+
+//
+//             NETWORk
+//
+
+
+static struct mg_mgr mgr;
+static struct mg_connection *ws_conn = NULL;
+static bool connected = false;
+static pthread_t networkThread;
+static bool networkRunning = false;
+
+
+//
+//             FRIENDS
+//
+
 
 typedef struct {
     bool isFirstUsed;
@@ -38,12 +45,24 @@ typedef struct {
     char avatarUrl[MAX_AVATAR+1];
     char profileDescription[MAX_DESC+1];
 } Config;
+typedef struct {
+    char name[MAX_NAME+1];
+    long userId;
+    char profileDescription[MAX_DESC+1];
+    char avatarUrl[MAX_AVATAR+1];
+} Friend;
+Friend Friends[100];
+
+
+//
+//             CONFIG LOAD
+//
 
 
 bool loadConfig(Config *cfg) {
     FILE *f = fopen(CONFIG_FILE, "r");
     if (!f) {
-        TraceLog(LOG_WARNING, "conf.txt не найден или поврежден. conft.txt будет пересоздан.");
+        TraceLog(LOG_WARNING, "\n\nconf.txt не найден или поврежден. conft.txt будет пересоздан.\n\n");
         return false;
     }
     memset(cfg, 0, sizeof(Config));
@@ -68,7 +87,7 @@ bool loadConfig(Config *cfg) {
             errno = 0;
             cfg->userId=strtol(value, &endptr, 10);
             if (errno !=0 || endptr == value) {
-                TraceLog(LOG_WARNING, "некорректный userId: %s", value);
+                TraceLog(LOG_WARNING, "\n\nнекорректный userId: %s\n\n", value);
                 cfg->userId=0000000000;
             }
         }
@@ -123,6 +142,12 @@ void HashPassword(const char* password, unsigned char* outHash) {
     SHA256((const unsigned char*)password, strlen(password), outHash);
 }
 
+
+//
+//             BOXED TEXT RENDERING
+//
+
+
 void DrawTextBoxed(Font font, const char *text, Rectangle container, float fontSize, float spacing, Color tint) {
     int length = (int)TextLength(text);
     float scaleFactor = fontSize / (float)font.baseSize;
@@ -159,7 +184,72 @@ void DrawTextBoxed(Font font, const char *text, Rectangle container, float fontS
     }
 }
 
+
+//
+//             NETWORK COMMUNICATION
+//
+
+
+static void ws_event_handler(struct mg_connection *c, int ev, void *ev_data){
+    if (ev == MG_EV_WS_OPEN) {
+        connected = true;
+        TraceLog(LOG_INFO, "\n\nwebsocket - открыт\n\n");
+        mg_ws_send(c, "{\"type\":\"auth\",\"userId\":0}", -1, WEBSOCKET_OP_TEXT);
+    }
+    else if (ev == MG_EV_WS_MSG) {
+        struct mg_ws_message *wm = ev_data;
+
+        char *msg = malloc(wm->data.len + 1);
+        memcpy(msg, wm->data.buf, wm->data.len);
+        msg[wm->data.len] = '\0';
+
+        TraceLog(LOG_INFO, "\n\nполучено: %s\n\n", msg);
+        // TODO: положить в очередь для главного потока
+
+        free(msg);
+    }
+    else if (ev == MG_EV_CLOSE) {
+        connected = false;
+        ws_conn = NULL;
+        TraceLog(LOG_WARNING, "\n\nwebsocket - закрыт\n\n");
+    }
+}
+
+static void* networkThreadFunc(void* arg){
+    while (networkRunning) {
+        mg_mgr_poll(&mgr, 30);
+    }
+    return NULL;
+}
+
+void connectToServer(void){
+    if (ws_conn) return;
+
+    ws_conn = mg_ws_connect(&mgr, "ws://127.0.0.1:8080/chat", ws_event_handler, NULL, NULL);
+
+    if (!ws_conn) TraceLog(LOG_ERROR, "\n\nошибка создание websocket\n\n");
+}
+
+void sendToServer(const char *json){
+    if (ws_conn && connected) mg_ws_send(ws_conn, json, -1, WEBSOCKET_OP_TEXT);
+}
+
+void renderFriends(void) {
+
+}
+
+
+//
+//             MAIN METHOD
+//
+
+
 int main(void) {
+    mg_mgr_init(&mgr);
+    networkRunning = true;
+    pthread_create(&networkThread, NULL, networkThreadFunc, NULL);
+    connectToServer();
+
     InitWindow(1600, 900, "UnChat - BETA 1.0");
     int codepoints[1024] = {0};
     int count = 0;
@@ -184,8 +274,8 @@ int main(void) {
     }
     char passwordInput[MAX_PASS+1] = {0};
     static int activeField=-1;
-    char newDesc[1026] = "";
-    char message[2050] = "";
+    char newDesc[1025] = "";
+    char message[2049] = "";
 
     while (!WindowShouldClose()) {
         BeginDrawing();
@@ -234,7 +324,7 @@ int main(void) {
                 DrawTextBoxed(font, config.profileDescription, textBounds, 16, 1.0f, WHITE);
             }
             if (GuiButton((Rectangle){1320, 700, 200, 50}, "Обновить")) {
-                newDesc[1025]='\0';
+                newDesc[1024]='\0';
                 strcpy(config.profileDescription, newDesc);
                 saveConfig(&config);
                 loadConfig(&config);
@@ -244,7 +334,7 @@ int main(void) {
                 activeField = (activeField == 5) ? -1 : 5;
             }
             if (GuiButton((Rectangle){1141, 839, 160, 60}, "Отправить") || IsKeyPressed(KEY_ENTER)) {
-                message[2049]='\0';
+                message[2048]='\0';
                 // TODO: send message
                 memset(message, 0, sizeof(message));
             }
