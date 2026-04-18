@@ -26,6 +26,8 @@
 #define MAX_EMAIL 23
 #define MAX_PASS 23
 #define MAX_AVATAR 64
+#define MAX_DESC 1024
+#define MAX_MESS 2048
 
 typedef struct {
     bool isFirstUsed;
@@ -34,7 +36,7 @@ typedef struct {
     char email[MAX_EMAIL+1];
     unsigned char passwordHash[SHA256_DIGEST_LENGTH];
     char avatarUrl[MAX_AVATAR+1];
-    char profileDescription[1025];
+    char profileDescription[MAX_DESC+1];
 } Config;
 
 
@@ -62,7 +64,7 @@ bool loadConfig(Config *cfg) {
             cfg->isFirstUsed=(strcmp(value, "true")==0);
         }
         else if (strcmp(key, "userId") == 0) {
-            char *endptr = NULL;
+            char *endptr = nullptr;
             errno = 0;
             cfg->userId=strtol(value, &endptr, 10);
             if (errno !=0 || endptr == value) {
@@ -182,10 +184,12 @@ int main(void) {
     }
     char passwordInput[MAX_PASS+1] = {0};
     static int activeField=-1;
+    char newDesc[1026] = "";
+    char message[2050] = "";
 
     while (!WindowShouldClose()) {
         BeginDrawing();
-        ClearBackground(BLACK);
+        ClearBackground((Color){ 40, 40, 40, 255 });
 
         if (config.isFirstUsed) {
             DrawTextEx(font, "Добро пожаловать. Пройди настройку профиля:", (Vector2){100, 50}, 40, 3, WHITE);
@@ -198,7 +202,7 @@ int main(void) {
             if (GuiTextBox((Rectangle){100, 290, 400, 40}, passwordInput, MAX_PASS, activeField==2)) {
                 activeField = (activeField == 2) ? -1 : 2;
             }
-            if (GuiTextBox((Rectangle){100, 360, 400, 40}, config.profileDescription, MAX_PASS, activeField==3)) {
+            if (GuiTextBox((Rectangle){100, 360, 400, 40}, config.profileDescription, MAX_DESC, activeField==3)) {
                 activeField = (activeField == 3) ? -1 : 3;
             }
             DrawTextEx(font,"Юзернейм", (Vector2){520, 160}, 20, 3, LIGHTGRAY);
@@ -212,19 +216,38 @@ int main(void) {
                 saveConfig(&config);
             }
         } else {
-            DrawRectangleLines(1, 1, 300, 899, WHITE);
-            DrawRectangleLines(301, 1, 1000, 899, WHITE);
-            DrawRectangleLines(1301, 1, 299, 899, WHITE);
-            DrawLine(1, 40, 1600, 40, WHITE);
+            DrawRectangleLines(1, 1, 300, 899, GRAY);
+            DrawRectangleLines(301, 1, 1000, 899, GRAY);
+            DrawRectangleLines(1301, 1, 299, 899, GRAY);
+            DrawLine(1, 40, 1600, 40, GRAY);
             DrawTextEx(font, "Знакомые", (Vector2){87, 10}, 24, 2, WHITE);
             DrawTextEx(font, "Чат", (Vector2){760, 10}, 24, 2, WHITE);
             DrawTextEx(font, "Профиль", (Vector2){1400, 10}, 24, 2, WHITE);
 
-            DrawRectangleLines(1320, 90, 128, 128, WHITE);
+            DrawRectangleLines(1320, 90, 128, 128, GRAY);
             DrawTextEx(font, TextFormat("%s", config.userName), (Vector2){1320, 230}, 24, 1.0f, WHITE);
-            DrawRectangleLines(1320, 270, 260, 400, GRAY);
+            //DrawRectangleLines(1320, 270, 260, 400, GRAY);
             Rectangle textBounds = { 1326, 276, 248, 388 };
-            DrawTextBoxed(font, config.profileDescription, textBounds, 16, 1.0f, WHITE);
+            if (GuiTextBox((Rectangle){1320, 270, 260, 400}, newDesc, MAX_DESC, activeField==4)) {
+                activeField = (activeField == 4) ? -1 : 4;
+            } else {
+                DrawTextBoxed(font, config.profileDescription, textBounds, 16, 1.0f, WHITE);
+            }
+            if (GuiButton((Rectangle){1320, 700, 200, 50}, "Обновить")) {
+                newDesc[1025]='\0';
+                strcpy(config.profileDescription, newDesc);
+                saveConfig(&config);
+                loadConfig(&config);
+                memset(newDesc, 0, sizeof(newDesc));
+            }
+            if (GuiTextBox((Rectangle){300, 839, 861, 60}, message, MAX_MESS, activeField==5)) {
+                activeField = (activeField == 5) ? -1 : 5;
+            }
+            if (GuiButton((Rectangle){1141, 839, 160, 60}, "Отправить") || IsKeyPressed(KEY_ENTER)) {
+                message[2049]='\0';
+                // TODO: send message
+                memset(message, 0, sizeof(message));
+            }
         }
 
         EndDrawing();
