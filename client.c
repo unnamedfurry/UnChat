@@ -7,8 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <openssl/sha.h>
-#include "mongoose.h"
+#include <sys/socket.h>
 
 #define CONFIG_FILE "conf.txt"
 #define MAX_NAME 23
@@ -17,24 +20,6 @@
 #define MAX_AVATAR 64
 #define MAX_DESC 1024
 #define MAX_MESS 2048
-
-
-//
-//             NETWORk
-//
-
-
-static struct mg_mgr mgr;
-static struct mg_connection *ws_conn = NULL;
-static bool connected = false;
-static pthread_t networkThread;
-static bool networkRunning = false;
-
-
-//
-//             FRIENDS
-//
-
 
 typedef struct {
     bool isFirstUsed;
@@ -52,6 +37,83 @@ typedef struct {
     char avatarUrl[MAX_AVATAR+1];
 } Friend;
 Friend Friends[100];
+Config config = {0};
+
+
+//
+//             NETWORK COMMUNICATION
+//
+
+
+#define SERVER_IP "127.0.0.1"
+#define SERVER_PORT 63321
+#define BUFFER_SIZE 2077
+static pthread_t thread_id;
+static int sock = -1;
+static struct sockaddr_in serv_addr;
+bool connected = false;
+char buf[BUFFER_SIZE];
+
+void* recieveMessage(void* arg) {
+    while (connected) {
+        int answerByte = read(sock, buf, sizeof(buf)-1);
+        if (answerByte <= 0) {
+            connected = false;
+            printf("\nconnection closed\n");
+            break;
+        }
+        buf[answerByte] = 0;
+        printf("\ngot from server: %s\n", buf);
+
+        if (strncmp(buf, "save-profile/", 13) == 0) {
+            printf("\nprofile successfully saved on server");
+        }
+        else if (strlen(buf) > 5 && isdigit(buf[0])) {
+            // скорее всего createId/
+            long newId = atol(buf);
+            if (newId > 0) {
+                config.userId = newId;
+                printf("\ngot new id: %ld", newId);
+            }
+        }
+    }
+    return NULL;
+}
+bool initNetwork(void) {
+    if (connected) return true;
+    // Create socket
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    // Define server target
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr);
+    // Connect to server
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("\nfailed to connect to server\n\n");
+        return false;
+    }
+    connected=true;
+    // Create a listener
+    if (pthread_create(&thread_id, NULL, recieveMessage, NULL) != 0) {
+        perror("\nfailed to create listener thread\n\n");
+    }
+    return true;
+}
+void sendMessage(const char *message) {
+    if (!connected) {
+        if (!initNetwork()) return;
+    }
+    if (send(sock, message, strlen(message), 0) < 0) {
+        printf("\nerror sending message: %s\n", message);
+        connected = false;
+    } else {
+        printf("\nsent successfully: %s\n", message);
+    }
+}
+
+void renderFriends(void) {
+
+}
 
 
 //
@@ -88,7 +150,8 @@ bool loadConfig(Config *cfg) {
             cfg->userId=strtol(value, &endptr, 10);
             if (errno !=0 || endptr == value) {
                 TraceLog(LOG_WARNING, "\n\nнекорректный userId: %s\n\n", value);
-                cfg->userId=0000000000;
+                cfg->isFirstUsed=true;
+                return false;
             }
         }
         else if (strcmp(key, "userName") == 0) {
@@ -107,7 +170,7 @@ bool loadConfig(Config *cfg) {
                 }
             }
         }
-        else if (strcmp(key, "avatarHash") == 0) {
+        else if (strcmp(key, "avatarUrl") == 0) {
             strncpy(cfg->avatarUrl, value, sizeof(cfg->avatarUrl)-1);
             cfg->avatarUrl[sizeof(cfg->avatarUrl)-1] ='\0';
         }
@@ -123,18 +186,34 @@ bool loadConfig(Config *cfg) {
 bool saveConfig(Config *cfg) {
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return false;
+
     fprintf(f, "isFirstUsed=%s\n", cfg->isFirstUsed ? "true" : "false");
-    fprintf(f, "userId=%s\n", cfg->userId==0 ? "0000000000" : cfg->userName);
+    fprintf(f, "userId=%ld\n", cfg->userId);
     fprintf(f, "userName=%s\n", cfg->userName);
     fprintf(f, "email=%s\n", cfg->email);
+
     fprintf(f, "passwordHash=");
-    for (int i=0; i<SHA256_DIGEST_LENGTH; i++) {
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         fprintf(f, "%02x", cfg->passwordHash[i]);
     }
     fprintf(f, "\n");
+
     fprintf(f, "avatarUrl=%s\n", cfg->avatarUrl);
     fprintf(f, "profileDescription=%s\n", cfg->profileDescription);
     fclose(f);
+
+    char hashHex[65] = {0};
+    for (int i = 0; i < 32; i++) {
+        sprintf(hashHex + i*2, "%02x", cfg->passwordHash[i]);
+    }
+
+    char message[2048] = {0};
+    snprintf(message, sizeof(message),
+             "save-profile/%ld\x1E%s\x1E%s\x1E%s\x1E%s\x1E%s",
+             cfg->userId, cfg->userName, cfg->email, hashHex,
+             cfg->avatarUrl, cfg->profileDescription);
+
+    sendMessage(message);
     return true;
 }
 
@@ -186,70 +265,11 @@ void DrawTextBoxed(Font font, const char *text, Rectangle container, float fontS
 
 
 //
-//             NETWORK COMMUNICATION
-//
-
-
-static void ws_event_handler(struct mg_connection *c, int ev, void *ev_data){
-    if (ev == MG_EV_WS_OPEN) {
-        connected = true;
-        TraceLog(LOG_INFO, "\n\nwebsocket - открыт\n\n");
-        mg_ws_send(c, "{\"type\":\"auth\",\"userId\":0}", -1, WEBSOCKET_OP_TEXT);
-    }
-    else if (ev == MG_EV_WS_MSG) {
-        struct mg_ws_message *wm = ev_data;
-
-        char *msg = malloc(wm->data.len + 1);
-        memcpy(msg, wm->data.buf, wm->data.len);
-        msg[wm->data.len] = '\0';
-
-        TraceLog(LOG_INFO, "\n\nполучено: %s\n\n", msg);
-        // TODO: положить в очередь для главного потока
-
-        free(msg);
-    }
-    else if (ev == MG_EV_CLOSE) {
-        connected = false;
-        ws_conn = NULL;
-        TraceLog(LOG_WARNING, "\n\nwebsocket - закрыт\n\n");
-    }
-}
-
-static void* networkThreadFunc(void* arg){
-    while (networkRunning) {
-        mg_mgr_poll(&mgr, 30);
-    }
-    return NULL;
-}
-
-void connectToServer(void){
-    if (ws_conn) return;
-
-    ws_conn = mg_ws_connect(&mgr, "ws://127.0.0.1:8080/chat", ws_event_handler, NULL, NULL);
-
-    if (!ws_conn) TraceLog(LOG_ERROR, "\n\nошибка создание websocket\n\n");
-}
-
-void sendToServer(const char *json){
-    if (ws_conn && connected) mg_ws_send(ws_conn, json, -1, WEBSOCKET_OP_TEXT);
-}
-
-void renderFriends(void) {
-
-}
-
-
-//
 //             MAIN METHOD
 //
 
 
 int main(void) {
-    mg_mgr_init(&mgr);
-    networkRunning = true;
-    pthread_create(&networkThread, NULL, networkThreadFunc, NULL);
-    connectToServer();
-
     InitWindow(1600, 900, "UnChat - BETA 1.0");
     int codepoints[1024] = {0};
     int count = 0;
@@ -257,6 +277,7 @@ int main(void) {
     for (int i = 0x0400; i <= 0x04FF; i++) codepoints[count++] = i;
     InitAudioDevice();
     SetTargetFPS(60);
+    SetTraceLogLevel(LOG_NONE);
 
     Font font = LoadFontEx("Pixellari.ttf", 64, codepoints, count);
     GenTextureMipmaps(&font.texture);
@@ -264,7 +285,9 @@ int main(void) {
     GuiSetFont(font);
     GuiSetStyle(DEFAULT, 16, 24);
 
-    Config config = {0};
+    initNetwork();
+    sendMessage("test/");
+
     bool loadedConf = loadConfig(&config);
     if (!loadedConf || config.isFirstUsed) {
         strcpy(config.userName, "");
@@ -301,8 +324,18 @@ int main(void) {
             DrawTextEx(font, "Описание профиля (опционально)", (Vector2){520, 370}, 20, 3, LIGHTGRAY);
 
             if (GuiButton((Rectangle){100, 450, 200, 50}, "Сохранить и продолжить")) {
+                if (strlen(config.userName) < 3) {
+                    // log error?
+                    continue;
+                }
+
                 HashPassword(passwordInput, config.passwordHash);
-                config.isFirstUsed=false;
+                config.isFirstUsed = false;
+                sendMessage("createId/");
+
+                // awaiting for responce
+                sleep(1);        // or through flag
+
                 saveConfig(&config);
             }
         } else {
@@ -336,12 +369,22 @@ int main(void) {
             if (GuiButton((Rectangle){1141, 839, 160, 60}, "Отправить") || IsKeyPressed(KEY_ENTER)) {
                 message[2048]='\0';
                 // TODO: send message
+                if (strlen(message) == 0) continue;
+                char parsed[BUFFER_SIZE] = {0};
+                snprintf(parsed, sizeof(parsed), "recieve-message/%ld\x1E%s", config.userId, message);
+
+                sendMessage(parsed);
                 memset(message, 0, sizeof(message));
+                memset(parsed, 0, strlen(parsed));
+                memset(buf, 0, sizeof(buf));
             }
         }
 
         EndDrawing();
     }
+    // Close connection
+    close(sock);
+
     UnloadFont(font);
     CloseAudioDevice();
     CloseWindow();

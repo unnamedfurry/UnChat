@@ -6,7 +6,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(raylib 5.0 REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-add_executable(client client.c mongoose.c)
+add_executable(client client.c)
 add_executable(server server.c)
 target_link_libraries(client PRIVATE raylib GL m pthread dl rt X11 OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(server PRIVATE m pthread OpenSSL::SSL OpenSSL::Crypto)
