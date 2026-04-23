@@ -21,6 +21,22 @@
 #define MAX_DESC 1024
 #define MAX_MESS 2048
 
+#define RESET   "\033[0m"
+#define cRED     "\033[31m"
+#define cGREEN   "\033[32m"
+#define cYELLOW  "\033[33m"
+#define cBLUE    "\033[34m"
+#define cMAGENTA "\033[35m"
+#define cCYAN    "\033[36m"
+
+#define BRED    "\033[1;31m"
+#define BGREEN  "\033[1;32m"
+#define BYELLOW "\033[1;33m"
+#define BBLUE   "\033[1;34m"
+#define BMAGENTA "\033[1;35m"
+#define BCYAN   "\033[1;36m"
+#define BWHITE  "\033[1;37m"
+
 typedef struct {
     bool isFirstUsed;
     long userId;
@@ -30,14 +46,19 @@ typedef struct {
     char avatarUrl[MAX_AVATAR+1];
     char profileDescription[MAX_DESC+1];
 } Config;
+Config config = {0};
 typedef struct {
     char name[MAX_NAME+1];
     long userId;
     char profileDescription[MAX_DESC+1];
     char avatarUrl[MAX_AVATAR+1];
 } Friend;
-Friend Friends[100];
-Config config = {0};
+Friend friends[100] = {0};
+typedef struct {
+    char messageId[11];
+    char message[2049];
+} Message;
+Message messages[1000000] = {0};
 
 
 //
@@ -56,25 +77,51 @@ char buf[BUFFER_SIZE];
 
 void* recieveMessage(void* arg) {
     while (connected) {
-        int answerByte = read(sock, buf, sizeof(buf)-1);
+        int answerByte = (int)read(sock, buf, sizeof(buf)-1);
         if (answerByte <= 0) {
             connected = false;
-            printf("\nconnection closed\n");
+            printf("\n" cYELLOW "connection closed" RESET);
             break;
         }
         buf[answerByte] = 0;
-        printf("\ngot from server: %s\n", buf);
+        printf("\n" cYELLOW "got from server: %s" RESET, buf);
 
         if (strncmp(buf, "save-profile/", 13) == 0) {
-            printf("\nprofile successfully saved on server");
+            printf("\n" cGREEN "profile successfully saved on server" RESET);
         }
         else if (strlen(buf) > 5 && isdigit(buf[0])) {
             // скорее всего createId/
             long newId = atol(buf);
             if (newId > 0) {
                 config.userId = newId;
-                printf("\ngot new id: %ld", newId);
+                printf("\n" cGREEN "got new id: %ld" RESET, newId);
             }
+        }
+        else if (strncmp(buf, "getFriendsList/", 15) == 0) {
+            int count = 0;
+            char *token = strtok(buf + 15, "\x1E");
+            Friend friend_;
+            while (token && count < 100) {
+                char *parts[4] = {0};
+                int count2 = 0;
+                char *token2 = strtok(token, "\x1F");
+                while (token2 && count2 < 4) {
+                    parts[count2++] = token2;
+                    token2 = strtok(nullptr, "\x1F");
+                }
+                strcpy(friend_.name, parts[0]);
+                char *endptr = nullptr;
+                friend_.userId = strtol(parts[1], &endptr, 10);
+                strcpy(friend_.profileDescription, parts[2]);
+                strcpy(friend_.avatarUrl, parts[3]);
+                friends[count] = friend_;
+                token = strtok(nullptr, "\x1E");
+                count++;
+            }
+            printf("\n" cGREEN "received friends list" RESET);
+        }
+        else if (strncmp(buf, "getChatHistory/", 15) == 0) {
+
         }
     }
     return NULL;
@@ -89,13 +136,13 @@ bool initNetwork(void) {
     inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr);
     // Connect to server
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        printf("\nfailed to connect to server\n\n");
+        printf("\n" cRED "failed to connect to server" RESET "\n\n");
         return false;
     }
     connected=true;
     // Create a listener
-    if (pthread_create(&thread_id, NULL, recieveMessage, NULL) != 0) {
-        perror("\nfailed to create listener thread\n\n");
+    if (pthread_create(&thread_id, nullptr, recieveMessage, NULL) != 0) {
+        perror("\n" cRED "failed to create listener thread" RESET "\n\n");
     }
     return true;
 }
@@ -104,15 +151,11 @@ void sendMessage(const char *message) {
         if (!initNetwork()) return;
     }
     if (send(sock, message, strlen(message), 0) < 0) {
-        printf("\nerror sending message: %s\n", message);
+        printf("\n" cRED "error sending message: %s" RESET "\n", message);
         connected = false;
     } else {
-        printf("\nsent successfully: %s\n", message);
+        printf("\n" cGREEN "sent successfully: %s" RESET "\n", message);
     }
-}
-
-void renderFriends(void) {
-
 }
 
 
@@ -124,7 +167,7 @@ void renderFriends(void) {
 bool loadConfig(Config *cfg) {
     FILE *f = fopen(CONFIG_FILE, "r");
     if (!f) {
-        TraceLog(LOG_WARNING, "\n\nconf.txt не найден или поврежден. conft.txt будет пересоздан.\n\n");
+        TraceLog(LOG_WARNING, "\n\n" cYELLOW "conf.txt не найден или поврежден. conft.txt будет пересоздан." RESET "\n\n");
         return false;
     }
     memset(cfg, 0, sizeof(Config));
@@ -149,7 +192,7 @@ bool loadConfig(Config *cfg) {
             errno = 0;
             cfg->userId=strtol(value, &endptr, 10);
             if (errno !=0 || endptr == value) {
-                TraceLog(LOG_WARNING, "\n\nнекорректный userId: %s\n\n", value);
+                TraceLog(LOG_WARNING, "\n\n" cRED "некорректный userId: %s" RESET "\n\n", value);
                 cfg->isFirstUsed=true;
                 return false;
             }
@@ -294,6 +337,10 @@ int main(void) {
         strcpy(config.email, "");
         strcpy(config.profileDescription, "");
         config.isFirstUsed=true;
+    } else {
+        char message[27] = {0};
+        sprintf(message, "getFriendsList/%ld/", config.userId);
+        sendMessage(message);
     }
     char passwordInput[MAX_PASS+1] = {0};
     static int activeField=-1;
@@ -368,7 +415,6 @@ int main(void) {
             }
             if (GuiButton((Rectangle){1141, 839, 160, 60}, "Отправить") || IsKeyPressed(KEY_ENTER)) {
                 message[2048]='\0';
-                // TODO: send message
                 if (strlen(message) == 0) continue;
                 char parsed[BUFFER_SIZE] = {0};
                 snprintf(parsed, sizeof(parsed), "recieve-message/%ld\x1E%s", config.userId, message);
@@ -378,6 +424,11 @@ int main(void) {
                 memset(parsed, 0, strlen(parsed));
                 memset(buf, 0, sizeof(buf));
             }
+            // TODO рендер друзей. нужно перебрать массив friends и отрисовать каждый слот в левой части.
+
+            
+
+            // TODO сделать группы
         }
 
         EndDrawing();
