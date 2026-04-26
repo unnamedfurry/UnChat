@@ -74,88 +74,144 @@ MYSQL *conn;
 //   long     char       char    char           char        char
 //
 //        messages table:
-// | messageId | messageContent |
-//   long        char
+// | userId | messageId | senderId | messageContent |
+//   long     long        long       char
 //
 //        friends table:
 // | userId | relatedUsersIds |
 //   long     long,long,long...
 //
 
-/* void safe_write(MYSQL *conn, const char *user_input) {
-    // buffer for screened string
-    // size: original size * 2 + 1 byte for \0
-    char escaped_input[strlen(user_input) * 2 + 1];
+bool saveUserToDB(long userId, const char *username, const char *email,
+                  const char *passwordHashHex, const char *avatarUrl, const char *profileDesc) {
 
-    // screening symbols
-    // params: sonnection, where to write to, where to take from, original string length
-    unsigned long len = mysql_real_escape_string(conn, escaped_input, user_input, strlen(user_input));
+    char esc_username[MAX_NAME*2 + 10];
+    char esc_email[MAX_EMAIL*2 + 10];
+    char esc_hash[SHA256_DIGEST_LENGTH*2 + 10];
+    char esc_avatar[MAX_AVATAR*2 + 10];
+    char esc_desc[MAX_DESC*2 + 100];
 
-    // creating SQL request
-    char query[1024];
-    sprintf(query, "INSERT INTO tags (name) VALUES ('%s')", escaped_input);
+    mysql_real_escape_string(conn, esc_username, username, strlen(username));
+    mysql_real_escape_string(conn, esc_email,    email,    strlen(email));
+    mysql_real_escape_string(conn, esc_hash,     passwordHashHex, strlen(passwordHashHex));
+    mysql_real_escape_string(conn, esc_avatar,   avatarUrl, strlen(avatarUrl));
+    mysql_real_escape_string(conn, esc_desc,     profileDesc, strlen(profileDesc));
+
+    char query[8192];
+
+    int written = snprintf(query, sizeof(query),
+        "INSERT INTO users (userId, username, email, passwordHash, avatarUrl, profileDesc) "
+        "VALUES (%ld, '%s', '%s', '%s', '%s', '%s') "
+        "ON DUPLICATE KEY UPDATE "
+        "username=VALUES(username), "
+        "email=VALUES(email), "
+        "passwordHash=VALUES(passwordHash), "
+        "avatarUrl=VALUES(avatarUrl), "
+        "profileDesc=VALUES(profileDesc)",
+        userId,
+        esc_username,
+        esc_email,
+        esc_hash,
+        esc_avatar,
+        esc_desc);
+
+    if (written < 0 || written >= sizeof(query)) {
+        fprintf(stderr, RED "\nsaveUserToDB: query buffer too small! Needed %d bytes" RESET, written);
+        return false;
+    }
 
     if (mysql_query(conn, query)) {
-        fprintf(stderr, "\n" RED "error saving to database: %s" RESET, mysql_error(conn));
-    } else {
-        printf("\n" GREEN "successfully saved data" RESET);
+        fprintf(stderr, RED "\nsaveUserToDB error: %s" RESET, mysql_error(conn));
+        return false;
     }
-} */
 
-void getFriends(MYSQL *conn, long user_id, int sock) {
-    char response[BUFFER_SIZE * 4] = {0};
+    printf(GREEN "\nUser %ld saved/updated successfully" RESET, userId);
+    return true;
+}
+
+bool saveMessageToDB(long messageId, long senderId, long receiverId, const char *message) {
+    char escaped_message[ MAX_MESS*2 + 1 ];
+    mysql_real_escape_string(conn, escaped_message, message, strlen(message));
+
+    char query[4096];
+    snprintf(query, sizeof(query),
+        "INSERT INTO messages (messageId, senderId, receiverId, message) "
+        "VALUES (%ld, %ld, %ld, '%s') "
+        "ON DUPLICATE KEY UPDATE "
+        "message=VALUES(message)",
+        messageId,
+        senderId,
+        receiverId,
+        escaped_message);
+
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, RED "\nsaveMessageToDB error: %s" RESET, mysql_error(conn));
+        return false;
+    }
+    return true;
+}
+
+void getFriends(long user_id, int sock) {
+    char response[8192] = {0};
     int offset = snprintf(response, sizeof(response), "getFriendsList/%ld\x1E", user_id);
 
-    char query[256];
-    snprintf(query, sizeof(query), "SELECT relatedUserIds FROM friends WHERE userId = %ld", user_id);
+    // getting relatedUserId
+    char query[512];
+    snprintf(query, sizeof(query),
+             "SELECT relatedUserId FROM friends WHERE userId = %ld", user_id);
+
     if (mysql_query(conn, query)) {
-        printf(RED "\nfailed to get friends for user %ld" RESET, user_id);
+        printf(RED "\ngetFriends: failed to query friends for user %ld" RESET, user_id);
         send(sock, "getFriendsList/error", 21, 0);
         return;
     }
+
     MYSQL_RES *res = mysql_store_result(conn);
     if (res == NULL) {
         send(sock, "getFriendsList/empty", 21, 0);
         return;
     }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    if (row == NULL || row[0] == NULL || strlen(row[0]) == 0) {
-        send(sock, "getFriendsList/empty", 21, 0);
-        return;
-    }
 
-    char *id_token = strtok(row[0], ",");
-    mysql_free_result(res);
-    while (id_token != NULL) {
-        long friend_id = strtol(id_token, NULL, 10);
-        if (friend_id <= 0) {
-            id_token = strtok(NULL, ",");
-            continue;
-        }
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (row[0] == NULL) continue;
 
-        snprintf(query, sizeof(query), "SELECT username, avatarurl, profiledesc FROM users WHERE userId = %ld", friend_id);
+        long friend_id = strtol(row[0], NULL, 10);
+        if (friend_id <= 0) continue;
+
+        // requesting data
+        snprintf(query, sizeof(query),
+                 "SELECT username, avatarUrl, profileDesc "
+                 "FROM users WHERE userId = %ld", friend_id);
+
         if (mysql_query(conn, query) == 0) {
             MYSQL_RES *fres = mysql_store_result(conn);
             if (fres) {
                 MYSQL_ROW frow = mysql_fetch_row(fres);
                 if (frow && frow[0]) {
-                    offset += snprintf(response+offset, sizeof(response)-offset, "%s\x1F%ld\x1F%s\x1F%s\x1E");
+                    offset += snprintf(response + offset, sizeof(response) - offset,
+                        "%s\x1F%ld\x1F%s\x1F%s\x1E",
+                        frow[0],                    // username
+                        friend_id,
+                        frow[1] ? frow[1] : "",     // avatarUrl
+                        frow[2] ? frow[2] : "");    // profileDesc
                 }
                 mysql_free_result(fres);
             }
         }
-        id_token = strtok(NULL, ",");
     }
+    mysql_free_result(res);
 
-    if (offset > 15) {
+    // sending result
+    if (offset > 15) {   // if there is atleast one friend
         send(sock, response, strlen(response), 0);
-        printf(GREEN "\ngetFriend: sent %d bytes for user %ld" RESET, (int)strlen(response), user_id);
+        printf(GREEN "\ngetFriends: sent %zu bytes for user %ld" RESET, strlen(response), user_id);
     } else {
         send(sock, "getFriendsList/empty", 21, 0);
     }
 }
 
-void getUsers(MYSQL *conn) {
+void getUsers(void) {
     if (mysql_query(conn, "SELECT userid, username FROM users")) {
         fprintf(stderr, "\n" RED "SELECT err: %s" RESET, mysql_error(conn));
     } else {
@@ -163,7 +219,7 @@ void getUsers(MYSQL *conn) {
         if (res == NULL) return;
 
         MYSQL_ROW row; // line array (char *)
-        int num_fields = mysql_num_fields(res); // number of columns
+        int num_fields = (int)mysql_num_fields(res); // number of columns
 
         while ((row = mysql_fetch_row(res))) {
             for(int i = 0; i < num_fields; i++) {
@@ -176,6 +232,40 @@ void getUsers(MYSQL *conn) {
     }
 }
 
+bool sendFriendRequest(long senderId, long receiverId) {
+    if (senderId == receiverId) return false;
+
+    char query[512];
+    snprintf(query, sizeof(query),
+        "INSERT INTO friend_requests (senderId, receiverId) "
+        "VALUES (%ld, %ld) ON DUPLICATE KEY UPDATE status='pending'",
+        senderId, receiverId);
+
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, RED "sendFriendRequest error: %s\n" RESET, mysql_error(conn));
+        return false;
+    }
+    return true;
+}
+
+bool acceptFriendRequest(long receiverId, long senderId) {
+    // changing status
+    char query[512];
+    snprintf(query, sizeof(query),
+        "UPDATE friend_requests SET status='accepted' "
+        "WHERE senderId=%ld AND receiverId=%ld AND status='pending'",
+        senderId, receiverId);
+
+    if (mysql_query(conn, query)) return false;
+
+    // two-way friendship
+    snprintf(query, sizeof(query),
+        "INSERT IGNORE INTO friends (userId, relatedUserId) VALUES (%ld, %ld), (%ld, %ld)",
+        senderId, receiverId, receiverId, senderId);
+
+    return mysql_query(conn, query) == 0;
+}
+
 void* acceptMessage(void *arg) {
     int sock = *(int*)arg;
     free(arg);
@@ -184,7 +274,7 @@ void* acceptMessage(void *arg) {
 
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
-        int valread = read(sock, buffer, BUFFER_SIZE - 1);
+        int valread = (int)read(sock, buffer, BUFFER_SIZE - 1);
 
         if (valread <= 0) {
             printf("\n" YELLOW "client disconnected (sock %d)" RESET, sock);
@@ -192,55 +282,106 @@ void* acceptMessage(void *arg) {
         }
 
         buffer[valread] = '\0';
-        printf("\n" YELLOW "received from client: %s" RESET, buffer);
+        printf("\n\n" YELLOW "received from client: %s" RESET, buffer);
 
         if (strcmp(buffer, "test/") == 0) {
             strcpy(response, "ok");
         }
         else if (strncmp(buffer, "receive-message/", 16) == 0) {
             printf("\n" GREEN "saving message: %s" YELLOW, buffer);
-            // TODO save to database
-            strcpy(response, "ok");
+            char *parts[4] = {0};
+            int count = 0;
+            char *token = strtok(buffer + 16, "\x1E");
+            while (token && count < 4) {
+                parts[count++] = token;
+                token = strtok(nullptr, "\x1E");
+            }
+            long messageId = strtol(parts[0], nullptr, 10);
+            long senderId = strtol(parts[1], nullptr, 10);
+            long receiverId = strtol(parts[2], nullptr, 10);
+            if (saveMessageToDB(messageId, senderId, receiverId, parts[3]) == true) {
+                printf(GREEN "\nsaved message to db: %ld, %ld" RESET, senderId, messageId);
+                strcpy(response, "ok");
+            } else {
+                printf(RED "\nfailed to save message to db: %ld, %ld" RESET, senderId, messageId);
+                strcpy(response, "err");
+            }
         }
-        else if (strncmp(buffer, "createId/", 9) == 0) {
+        else if (strncmp(buffer, "createId/user", 13) == 0) {
             srand(time(nullptr) + clock());
             long id = rand()%2147483647;
-            sprintf(response, "\n" GREEN "newId generated: %ld" RESET, id);
+            sprintf(response, "createId/%ld", id);
+            printf("\n" GREEN "newId generated for user: %ld" RESET, id);
+        }
+        else if (strncmp(buffer, "createId/message", 16) == 0) {
+            srand(time(nullptr) + clock());
+            long id = rand()%2147483647;
+            sprintf(response, "createId/%ld", id);
+            printf("\n" GREEN "newId generated for message: %ld" RESET, id);
         }
         else if (strncmp(buffer, "save-profile/", 13) == 0) {
-            printf("\n" GREEN "save-profile received: %s\n" RESET, buffer);
+            printf(GREEN "\nsave-profile received" RESET);
 
-            char *parts[10] = {0};
+            char *parts[6] = {0};
             int count = 0;
             char *token = strtok(buffer + 13, "\x1E");
 
-            while (token && count < 10) {
+            while (token && count < 6) {
                 parts[count++] = token;
                 token = strtok(nullptr, "\x1E");
             }
 
-            // TODO save to database
             if (count >= 6) {
-                printf(MAGENTA"  UserID:       %s\n", parts[0]);
-                printf("  Name:         %s\n", parts[1]);
-                printf("  Email:        %s\n", parts[2]);
-                printf("  PasswordHash: %s\n", parts[3]);
-                printf("  AvatarUrl:    %s\n", parts[4]);
-                printf("  ProfileDesc:  %s\n" RESET, parts[5]);
-            }
+                long uid = strtol(parts[0], nullptr, 10);
+                bool success = saveUserToDB(uid,
+                                            parts[1], parts[2], parts[3],
+                                            parts[4], parts[5]);
 
-            strcpy(response, "ok");
+                if (success) {
+                    send(sock, "save-profile/ok", 15, 0);
+                } else {
+                    send(sock, "save-profile/error", 18, 0);
+                }
+            } else {
+                send(sock, "save-profile/badformat", 22, 0);
+            }
         }
         else if (strncmp(buffer, "getFriendsList/", 15) == 0) {
-            long user_id = strtol(buffer+15, NULL, 10);
+            long user_id = strtol(buffer + 15, nullptr, 10);
             if (user_id > 0) {
-                getFriends(conn, user_id, sock);
-                return NULL;
+                getFriends(user_id, sock);
+                // return NULL;
+                // continue;   maybe better???
             }
+            continue;
+        }
+        else if (strncmp(buffer, "addFriend/", 10) == 0) {
+            char *parts[2] = {0};
+            int count = 0;
+            char *token = strtok(buffer + 10, "\x1E");
+            while (token && count < 6) {
+                parts[count++] = token;
+                token = strtok(nullptr, "\x1E");
+            }
+            long senderId = strtol(parts[0], nullptr, 10);
+            long receiverId = strtol(parts[1], nullptr, 10);
+            sendFriendRequest(senderId, receiverId);
+        }
+        else if (strncmp(buffer, "acceptFriend/", 13) == 0) {
+            char *parts[2] = {0};
+            int count = 0;
+            char *token = strtok(buffer + 10, "\x1E");
+            while (token && count < 6) {
+                parts[count++] = token;
+                token = strtok(nullptr, "\x1E");
+            }
+            long senderId = strtol(parts[1], nullptr, 10);
+            long receiverId = strtol(parts[0], nullptr, 10);
+            acceptFriendRequest(receiverId, senderId);
         }
 
         send(sock, response, strlen(response), 0);
-        printf("\n" YELLOW "sent responce for request: %s -> %s" RESET, buffer, response);
+        printf("\n" YELLOW "sent response for request: %s -> %s" RESET, buffer, response);
     }
 
     close(sock);
@@ -250,9 +391,9 @@ void* acceptMessage(void *arg) {
 int main(void) {
     // if we don't connect to database, chat probably won't work
     printf("\n" YELLOW "connecting ro mysql" RESET);
-    conn = mysql_init(NULL);
+    conn = mysql_init(nullptr);
 
-    if (mysql_real_connect(conn, "localhost", "root", "null", "unchat", 0, NULL, 0) == NULL) {
+    if (mysql_real_connect(conn, "localhost", "root", "681137", "unchat", 0, nullptr, 0) == NULL) {
         fprintf(stderr, "\n" RED "failed to connect to database: %s" RESET, mysql_error(conn));
         mysql_close(conn);
         return 0;
@@ -273,12 +414,15 @@ int main(void) {
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
 
         // friends (many-to-many)
-        "CREATE TABLE IF NOT EXISTS friends ("
-            "userId BIGINT UNSIGNED NOT NULL,"
-            "relatedUserId BIGINT UNSIGNED NOT NULL,"
-            "PRIMARY KEY (userId, relatedUserId),"                  // composite key
-            "FOREIGN KEY (userId) REFERENCES users(userId) ON DELETE CASCADE,"
-            "FOREIGN KEY (relatedUserId) REFERENCES users(userId) ON DELETE CASCADE"
+        "CREATE TABLE IF NOT EXISTS friend_requests ("
+            "id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,"
+            "senderId BIGINT UNSIGNED NOT NULL,"
+            "receiverId BIGINT UNSIGNED NOT NULL,"
+            "status ENUM('pending', 'accepted', 'rejected') NOT NULL DEFAULT 'pending',"
+            "createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "UNIQUE KEY unique_request (senderId, receiverId),"
+            "FOREIGN KEY (senderId) REFERENCES users(userId) ON DELETE CASCADE,"
+            "FOREIGN KEY (receiverId) REFERENCES users(userId) ON DELETE CASCADE"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
 
         // messages (lite version)
@@ -295,9 +439,9 @@ int main(void) {
 
     for (int i = 0; i < 3; i++) {
         if (mysql_query(conn, queries[i])) {
-            fprintf(stderr, RED "Ошибка создания таблицы %d: %s\n" RESET, i, mysql_error(conn));
+            fprintf(stderr, RED "\nОшибка создания таблицы %d: %s" RESET, i, mysql_error(conn));
         } else {
-            printf(GREEN "Таблица %d создана успешно!\n" RESET, i);
+            printf(GREEN "\nТаблица %d создана успешно!" RESET, i);
         }
     }
 

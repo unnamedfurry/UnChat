@@ -59,6 +59,9 @@ typedef struct {
     char message[2049];
 } Message;
 Message messages[1000000] = {0};
+long randomId = 0L;
+bool finishedResponse = false;
+long currentFriendId = 0L;
 
 
 //
@@ -76,53 +79,83 @@ bool connected = false;
 char buf[BUFFER_SIZE];
 
 void* recieveMessage(void* arg) {
+    char localBuf[BUFFER_SIZE];
+
     while (connected) {
-        int answerByte = (int)read(sock, buf, sizeof(buf)-1);
+        finishedResponse = false;
+        memset(localBuf, 0, sizeof(localBuf));
+
+        int answerByte = (int)read(sock, localBuf, sizeof(localBuf)-1);
         if (answerByte <= 0) {
             connected = false;
             printf("\n" cYELLOW "connection closed" RESET);
             break;
         }
-        buf[answerByte] = 0;
-        printf("\n" cYELLOW "got from server: %s" RESET, buf);
+        localBuf[answerByte] = '\0';
 
-        if (strncmp(buf, "save-profile/", 13) == 0) {
+        printf("\n" cYELLOW "got from server: %s" RESET, localBuf);
+
+        strncpy(buf, localBuf, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
+
+        if (strncmp(localBuf, "save-profile/", 13) == 0) {
             printf("\n" cGREEN "profile successfully saved on server" RESET);
         }
-        else if (strlen(buf) > 5 && isdigit(buf[0])) {
-            // скорее всего createId/
-            long newId = atol(buf);
+        else if (strncmp(localBuf, "createId/user", 13) == 0) {
+            long newId = atol(localBuf + 13);   // исправил +9 → +13
             if (newId > 0) {
                 config.userId = newId;
-                printf("\n" cGREEN "got new id: %ld" RESET, newId);
+                printf("\n" cGREEN "got new id for user: %ld" RESET, newId);
             }
         }
-        else if (strncmp(buf, "getFriendsList/", 15) == 0) {
+        else if (strncmp(localBuf, "createId/message", 16) == 0) {
+            long newId = atol(localBuf + 16);
+            if (newId > 0) {
+                randomId = newId;
+                printf("\n" cGREEN "got new id for message: %ld" RESET, newId);
+            }
+        }
+        else if (strncmp(localBuf, "getFriendsList/", 15) == 0) {
             int count = 0;
-            char *token = strtok(buf + 15, "\x1E");
-            Friend friend_;
+            char *token = strtok(localBuf + 15, "\x1E");
+
             while (token && count < 100) {
                 char *parts[4] = {0};
                 int count2 = 0;
                 char *token2 = strtok(token, "\x1F");
                 while (token2 && count2 < 4) {
                     parts[count2++] = token2;
-                    token2 = strtok(nullptr, "\x1F");
+                    token2 = strtok(NULL, "\x1F");
                 }
-                strcpy(friend_.name, parts[0]);
-                char *endptr = nullptr;
-                friend_.userId = strtol(parts[1], &endptr, 10);
-                strcpy(friend_.profileDescription, parts[2]);
-                strcpy(friend_.avatarUrl, parts[3]);
-                friends[count] = friend_;
-                token = strtok(nullptr, "\x1E");
-                count++;
-            }
-            printf("\n" cGREEN "received friends list" RESET);
-        }
-        else if (strncmp(buf, "getChatHistory/", 15) == 0) {
+                Friend friend_;
 
+                // Защита от NULL
+                if (parts[0]) strcpy(friend_.name, parts[0]);
+                else friend_.name[0] = '\0';
+
+                friend_.userId = (parts[1]) ? strtol(parts[1], NULL, 10) : 0;
+
+                if (parts[2]) strcpy(friend_.profileDescription, parts[2]);
+                else friend_.profileDescription[0] = '\0';
+
+                if (parts[3]) strcpy(friend_.avatarUrl, parts[3]);
+                else friend_.avatarUrl[0] = '\0';
+
+                friends[count] = friend_;
+                count++;
+
+                token = strtok(NULL, "\x1E");
+            }
+            printf("\n" cGREEN "received friends list (%d friends)" RESET, count);
         }
+        else if (strncmp(localBuf, "getChatHistory/", 15) == 0) {
+            // TODO
+        }
+        else if (strncmp(localBuf, "err", 3) == 0) {
+            printf("\n" cRED "Server returned error" RESET);
+        }
+
+        finishedResponse = true;
     }
     return NULL;
 }
@@ -155,6 +188,7 @@ void sendMessage(const char *message) {
         connected = false;
     } else {
         printf("\n" cGREEN "sent successfully: %s" RESET "\n", message);
+        finishedResponse=false;
     }
 }
 
@@ -320,7 +354,8 @@ int main(void) {
     for (int i = 0x0400; i <= 0x04FF; i++) codepoints[count++] = i;
     InitAudioDevice();
     SetTargetFPS(60);
-    SetTraceLogLevel(LOG_NONE);
+    SetTraceLogLevel(LOG_WARNING);
+    SetExitKey(KEY_NULL);
 
     Font font = LoadFontEx("Pixellari.ttf", 64, codepoints, count);
     GenTextureMipmaps(&font.texture);
@@ -328,7 +363,7 @@ int main(void) {
     GuiSetFont(font);
     GuiSetStyle(DEFAULT, 16, 24);
 
-    initNetwork();
+    bool initedNetwork = initNetwork();
     sendMessage("test/");
 
     bool loadedConf = loadConfig(&config);
@@ -346,6 +381,16 @@ int main(void) {
     static int activeField=-1;
     char newDesc[1025] = "";
     char message[2049] = "";
+    bool isAddingFriend = false;
+    char userId[10] = "";
+    static Texture2D userAvatarTexture = {0};
+    static char avatarPathInput[256] = {0};
+    if (strlen(config.avatarUrl) != 0) {
+        strncmp(avatarPathInput, config.avatarUrl, sizeof(config.avatarUrl));
+        Image img = LoadImage(avatarPathInput);
+        userAvatarTexture = LoadTextureFromImage(img);
+        UnloadImage(img);
+    }
 
     while (!WindowShouldClose()) {
         BeginDrawing();
@@ -378,7 +423,7 @@ int main(void) {
 
                 HashPassword(passwordInput, config.passwordHash);
                 config.isFirstUsed = false;
-                sendMessage("createId/");
+                sendMessage("createId/user");
 
                 // awaiting for responce
                 sleep(1);        // or through flag
@@ -393,8 +438,20 @@ int main(void) {
             DrawTextEx(font, "Знакомые", (Vector2){87, 10}, 24, 2, WHITE);
             DrawTextEx(font, "Чат", (Vector2){760, 10}, 24, 2, WHITE);
             DrawTextEx(font, "Профиль", (Vector2){1400, 10}, 24, 2, WHITE);
+            DrawLine(1, 80, 1600, 80, GRAY);
 
-            DrawRectangleLines(1320, 90, 128, 128, GRAY);
+            Rectangle avatarRect = {1320, 90, 128, 128};
+            DrawRectangleRec(avatarRect, DARKGRAY);
+
+            if (userAvatarTexture.id != 0) {
+                DrawTexturePro(userAvatarTexture,
+                               (Rectangle){0, 0, 128, 128},
+                               avatarRect,
+                               (Vector2){0, 0}, 0.0f, WHITE);
+            } else {
+                DrawRectangleLinesEx(avatarRect, 4, LIGHTGRAY);
+                DrawTextEx(font, "нет\nаватарки", (Vector2){1333, 120}, 24, 2, GRAY);
+            }
             DrawTextEx(font, TextFormat("%s", config.userName), (Vector2){1320, 230}, 24, 1.0f, WHITE);
             //DrawRectangleLines(1320, 270, 260, 400, GRAY);
             Rectangle textBounds = { 1326, 276, 248, 388 };
@@ -403,32 +460,148 @@ int main(void) {
             } else {
                 DrawTextBoxed(font, config.profileDescription, textBounds, 16, 1.0f, WHITE);
             }
-            if (GuiButton((Rectangle){1320, 700, 200, 50}, "Обновить")) {
+            if (GuiButton((Rectangle){1320, 680, 200, 50}, "Обновить")) {
                 newDesc[1024]='\0';
                 strcpy(config.profileDescription, newDesc);
                 saveConfig(&config);
                 loadConfig(&config);
-                memset(newDesc, 0, sizeof(newDesc));
             }
+
+            DrawTextEx(font, "Путь к аватарке:", (Vector2){1320, 760}, 20, 2, LIGHTGRAY);
+            if (GuiTextBox((Rectangle){1320, 790, 260, 40}, avatarPathInput, 255, activeField == 7)) {
+                activeField = (activeField == 7) ? -1 : 7;
+            }
+
+            if (GuiButton((Rectangle){1320, 840, 200, 50}, "Загрузить")) {
+                if (strlen(avatarPathInput) > 3) {
+                    Image img = LoadImage(avatarPathInput);
+
+                    if (img.data != NULL) {
+                        // square 128 by 128
+                        int side = (img.width < img.height) ? img.width : img.height;   // taking smallest side
+
+                        // crop to square
+                        Rectangle cropRect = {
+                            (float)(img.width - side) / 2.0f,      // x
+                            (float)(img.height - side) / 2.0f,     // y
+                            (float)side,                           // width
+                            (float)side                            // height
+                        };
+
+                        ImageCrop(&img, cropRect);
+                        ImageResize(&img, 128, 128);        // resize to 128x128
+
+                        // saving near config file
+                        const char *savePath = TextFormat("avatars/%ld.png", config.userId);
+
+                        // folder is not exist
+                        system("mkdir -p avatars");   // Linux + Windows
+
+                        if (ExportImage(img, savePath)) {
+                            printf(cGREEN "\navatar was cropped and saved: %s" RESET, savePath);
+
+                            // updating config
+                            snprintf(config.avatarUrl, MAX_AVATAR, "%ld.png", config.userId);
+
+                            // refreshing texture
+                            if (userAvatarTexture.id != 0) UnloadTexture(userAvatarTexture);
+                            userAvatarTexture = LoadTextureFromImage(img);
+
+                            saveConfig(&config);        // save and pull to server
+                        } else {
+                            printf(cRED "\nfailed to save avatar" RESET);
+                        }
+
+                        UnloadImage(img);
+                        memset(avatarPathInput, 0, sizeof(avatarPathInput));
+                    } else {
+                        printf(cRED "\nfailed to load image: %s" RESET, avatarPathInput);
+                    }
+                }
+            }
+
             if (GuiTextBox((Rectangle){300, 839, 861, 60}, message, MAX_MESS, activeField==5)) {
                 activeField = (activeField == 5) ? -1 : 5;
             }
             if (GuiButton((Rectangle){1141, 839, 160, 60}, "Отправить") || IsKeyPressed(KEY_ENTER)) {
-                message[2048]='\0';
-                if (strlen(message) == 0) continue;
-                char parsed[BUFFER_SIZE] = {0};
-                snprintf(parsed, sizeof(parsed), "recieve-message/%ld\x1E%s", config.userId, message);
+                if (strlen(message) != 0) {
+                    sendMessage("createId/message");
+                    if (!finishedResponse) usleep(1000);
+                    message[2048]='\0';
+                    char parsed[BUFFER_SIZE] = {0};
+                    snprintf(parsed, sizeof(parsed), "receive-message/%ld\x1E%ld\x1E%ld\x1E%s", randomId, config.userId, currentFriendId, message);
 
-                sendMessage(parsed);
-                memset(message, 0, sizeof(message));
-                memset(parsed, 0, strlen(parsed));
-                memset(buf, 0, sizeof(buf));
+                    sendMessage(parsed);
+                    memset(message, 0, sizeof(message));
+                    memset(parsed, 0, strlen(parsed));
+                }
+            }
+            if (GuiButton((Rectangle){20, 45, 100, 30}, "+ Друг")) {
+                isAddingFriend=true;
+            }
+            if (GuiButton((Rectangle){155, 45, 120, 30}, "+ Группа")) {
+
+            }
+            if (isAddingFriend == true) {
+                if (IsKeyPressed(KEY_ESCAPE)) isAddingFriend=false;
+                DrawRectangle(1600/2-200, 900/2-200, 400, 400, GRAY);
+                DrawRectangleLines(1600/2-200, 900/2-200, 400, 400, WHITE);
+                DrawRectangleLines(1600/2-190, 900/2-140, 381, 61, WHITE);
+                DrawTextEx(font, "Введи айди пользователя:", (Vector2){1600/2-190, 900/2-180}, 20, 2, WHITE);
+                if (GuiTextBox((Rectangle){1600/2-190, 900/2-140, 380, 60}, userId, 10, activeField==6)) {
+                    activeField = (activeField == 6) ? -1 : 6;
+                }
+                if (GuiButton((Rectangle){1600/2+96, 900/2+156, 100, 40}, "Далее")) {
+                    if (strlen(userId) == 0) continue;
+                    char parsed[21] = {0};
+                    snprintf(parsed, sizeof(parsed), "addFriend/%ld\x1E%s", config.userId, userId);
+                    sendMessage(parsed);
+                    isAddingFriend=false;
+                }
             }
             // TODO рендер друзей. нужно перебрать массив friends и отрисовать каждый слот в левой части.
+            int startY = 90;
+            for (int i = 0; i < 100 && friends[i].userId != 0; i++) {
+                Rectangle friendRect = { 10, startY, 280, 70 };
 
-            
+                if (CheckCollisionPointRec(GetMousePosition(), friendRect)) {
+                    DrawRectangleRec(friendRect, (Color){60, 60, 70, 255});
+                    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                        currentFriendId = friends[i].userId;
+                        // TODO: загрузить историю чата с этим другом
+                    }
+                } else {
+                    DrawRectangleRec(friendRect, (Color){50, 50, 60, 255});
+                }
+                DrawRectangleLinesEx(friendRect, 2, GRAY);
+
+                // friend avatar
+                Rectangle avatarRect = { 20, startY + 8, 54, 54 };
+                DrawRectangleRec(avatarRect, DARKGRAY);
+                DrawRectangleLinesEx(avatarRect, 2, LIGHTGRAY);
+
+                // name + description
+                DrawTextEx(font, friends[i].name, (Vector2){85, startY + 12}, 24, 2, WHITE);
+
+                if (strlen(friends[i].profileDescription) > 0) {
+                    char shortDesc[80];
+                    strncpy(shortDesc, friends[i].profileDescription, 70);
+                    shortDesc[70] = '\0';
+                    if (strlen(friends[i].profileDescription) > 70) strcat(shortDesc, "...");
+                    DrawTextEx(font, shortDesc, (Vector2){85, startY + 42}, 18, 2, LIGHTGRAY);
+                }
+
+                startY += 80;
+            }
+
 
             // TODO сделать группы
+        }
+
+        if (initedNetwork == false) {
+            DrawRectangle(1, 900/2-100, 1600, 200, GRAY);
+            DrawRectangleLines(1, 900/2-100, 1599, 199, RED);
+            DrawTextEx(font, "Потеряно соединение с сервером!", (Vector2){1600/2-470, 900/2-20}, 60, 2, RED);
         }
 
         EndDrawing();
@@ -436,6 +609,7 @@ int main(void) {
     // Close connection
     close(sock);
 
+    UnloadTexture(userAvatarTexture);
     UnloadFont(font);
     CloseAudioDevice();
     CloseWindow();
