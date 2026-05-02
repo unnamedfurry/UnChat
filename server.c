@@ -40,26 +40,6 @@ static pthread_t thread_id;
 #define MAX_AVATAR 64
 #define MAX_DESC 1024
 #define MAX_MESS 2048
-typedef struct {
-    bool isFirstUsed;
-    long userId;
-    char userName[MAX_NAME+1];
-    char email[MAX_EMAIL+1];
-    unsigned char passwordHash[SHA256_DIGEST_LENGTH];
-    char avatarUrl[MAX_AVATAR+1];
-    char profileDescription[MAX_DESC+1];
-} Config;
-Config config = {0};
-typedef struct {
-    char name[MAX_NAME+1];
-    long userId;
-    char profileDescription[MAX_DESC+1];
-    char avatarUrl[MAX_AVATAR+1];
-} Friend;
-typedef struct {
-    char messageId[11];
-    char message[2049];
-} Message;
 MYSQL *conn;
 
 //
@@ -81,6 +61,178 @@ MYSQL *conn;
 // | userId | relatedUsersIds |
 //   long     long,long,long...
 //
+
+//                     PUSH MODEL
+
+typedef struct ClientSession {
+    long userId;
+    int sock;
+    struct ClientSession *next;
+} ClientSession;
+
+static ClientSession *activeClients = nullptr;
+static pthread_mutex_t clientsMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// register client (after authorization)
+void registerClient(long userId, int sock) {
+    pthread_mutex_lock(&clientsMutex);
+
+    // removing old
+    ClientSession *curr = activeClients, *prev = nullptr;
+    while (curr) {
+        if (curr->userId == userId) {
+            close(curr->sock);
+            if (prev) prev->next = curr->next;
+            else activeClients = curr->next;
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    // new
+    ClientSession *session = malloc(sizeof(ClientSession));
+    session->userId = userId;
+    session->sock = sock;
+    session->next = activeClients;
+    activeClients = session;
+
+    printf(GREEN "\n[PUSH] client connected: userId=%ld, sock=%d" RESET, userId, sock);
+    pthread_mutex_unlock(&clientsMutex);
+}
+
+// remove client after disconnecting
+void unregisterClient(int sock) {
+    pthread_mutex_lock(&clientsMutex);
+    ClientSession *curr = activeClients, *prev = nullptr;
+
+    while (curr) {
+        if (curr->sock == sock) {
+            printf(YELLOW "\n[PUSH] client disconnected: userId=%ld" RESET, curr->userId);
+            if (prev) prev->next = curr->next;
+            else activeClients = curr->next;
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&clientsMutex);
+}
+
+// sending messages to online client
+bool pushToUser(long userId, const char *data) {
+    pthread_mutex_lock(&clientsMutex);
+    ClientSession *curr = activeClients;
+
+    while (curr) {
+        if (curr->userId == userId) {
+            int sent = (int)send(curr->sock, data, strlen(data), MSG_NOSIGNAL);
+            pthread_mutex_unlock(&clientsMutex);
+            return sent > 0;
+        }
+        curr = curr->next;
+    }
+
+    pthread_mutex_unlock(&clientsMutex);
+    return false; // client offline
+}
+
+void getClientUpdates(long userId) {
+    { // MESSAGES
+        int size = sizeof(char)*1050;
+        char *serverResponse = malloc(size);
+        if (serverResponse == NULL) { printf(RED "\nNot enough memory for updateClient answer." RESET); return; }
+        int offset = 0;
+        offset += snprintf(serverResponse+offset, sizeof(serverResponse) - offset, "updateClient/messages\x1E");
+
+        char query[512];
+        snprintf(query, sizeof(query),
+                "SELECT senderId, COUNT(*) as cnt "
+                      "FROM messages "
+                      "WHERE receiverId = %ld AND isRead = FALSE "
+                      "GROUP BY senderId", userId);
+        if (mysql_query(conn, query) == 0) {
+            MYSQL_RES *res = mysql_store_result(conn);
+            if (res) {
+                MYSQL_ROW row;
+                int totalNew = 0;
+                char message[1000] = {0};
+                int messageOffset = 0;
+
+                while ((row = mysql_fetch_row(res))) {
+                    long sender = strtol(row[0], nullptr, 10);
+                    int count = atoi(row[1]);
+                    totalNew += count;
+
+                    messageOffset += snprintf(message + messageOffset, sizeof(message) - messageOffset,
+                                      "%ld\x1F%d\x1E", sender, count);
+                }
+                mysql_free_result(res);
+
+                offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset,
+                                 "%d\x1E%s", totalNew, message);
+            } else {
+                offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0\x1E");
+            }
+        } else {
+            offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0\x1E");
+        }
+        pushToUser(userId, serverResponse);
+        free(serverResponse);
+    }
+
+    { // FRIEND REQUESTS
+        int size = sizeof(char)*1024;
+        char *serverResponse = malloc(size);
+        if (serverResponse == NULL) { printf(RED "\nNot enough memory for updateClient answer." RESET); return; }
+        int offset = 0;
+        offset += snprintf(serverResponse+offset, sizeof(serverResponse) - offset, "updateClient/friendRequests\x1E");
+
+        char query[512];
+        snprintf(query, sizeof(query),
+                "SELECT fr.id, fr.senderId, u.username, u.avatarUrl, u.profileDesc "
+                      "FROM friend_requests fr "
+                      "JOIN users u ON fr.senderId = u.userId "
+                      "WHERE fr.receiverId = %ld AND fr.status = 'pending' "
+                      "ORDER BY fr.createdAt DESC LIMIT 30", userId);
+
+        if (mysql_query(conn, query) == 0) {
+            MYSQL_RES *res = mysql_store_result(conn);
+            if (res) {
+                MYSQL_ROW row;
+                char message[5120] = {0};
+                int messageOffset = 0;
+
+                while ((row = mysql_fetch_row(res))) {
+                    messageOffset += snprintf(message+messageOffset, sizeof(message)-messageOffset,
+                    "%s\x1F%s\x1F%s\x1F%s\x1F%s\x1F%s\x1E",
+                          row[0], row[1], row[2], row[3] ? row[3] : "", row[4] ? row[4] : "", row[5]);
+
+                }
+                mysql_free_result(res);
+
+                int tempOffset = snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "%s", message);
+                if (tempOffset > size) {
+                    size+=2560;
+                    char *newServerResponce = realloc(serverResponse, size);
+                    if (newServerResponce) {
+                        serverResponse=newServerResponce;
+                        snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "%s", message);
+                    }
+                }
+                offset+=tempOffset;
+            } else {
+                offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0");
+            }
+        } else {
+            offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0");
+        }
+        pushToUser(userId, serverResponse);
+        free(serverResponse);
+    }
+}
 
 bool saveUserToDB(long userId, const char *username, const char *email,
                   const char *passwordHashHex, const char *avatarUrl, const char *profileDesc) {
@@ -233,7 +385,24 @@ void getUsers(void) {
 }
 
 bool sendFriendRequest(long senderId, long receiverId) {
-    if (senderId == receiverId) return false;
+    if (senderId == receiverId) {
+        printf(RED "\nнельзя добавить себя" RESET);
+        return false;
+    }
+
+    char check[256];
+    snprintf(check, sizeof(check),
+             "SELECT 1 FROM users WHERE userId = %ld", receiverId);
+
+    if (mysql_query(conn, check) == 0) {
+        MYSQL_RES *res = mysql_store_result(conn);
+        if (res && mysql_num_rows(res) == 0) {
+            mysql_free_result(res);
+            printf(RED "\nполучатель %ld не существует в базе" RESET, receiverId);
+            return false;
+        }
+        if (res) mysql_free_result(res);
+    }
 
     char query[512];
     snprintf(query, sizeof(query),
@@ -242,9 +411,11 @@ bool sendFriendRequest(long senderId, long receiverId) {
         senderId, receiverId);
 
     if (mysql_query(conn, query)) {
-        fprintf(stderr, RED "sendFriendRequest error: %s\n" RESET, mysql_error(conn));
+        fprintf(stderr, RED "\nsendFriendRequest FK error: %s" RESET, mysql_error(conn));
         return false;
     }
+
+    printf(GREEN "\nзапрос в друзья сохранён %ld -> %ld" RESET, senderId, receiverId);
     return true;
 }
 
@@ -299,9 +470,15 @@ void* acceptMessage(void *arg) {
             long messageId = strtol(parts[0], nullptr, 10);
             long senderId = strtol(parts[1], nullptr, 10);
             long receiverId = strtol(parts[2], nullptr, 10);
-            if (saveMessageToDB(messageId, senderId, receiverId, parts[3]) == true) {
-                printf(GREEN "\nsaved message to db: %ld, %ld" RESET, senderId, messageId);
-                strcpy(response, "ok");
+            if (saveMessageToDB(messageId, senderId, receiverId, parts[3])) {
+                printf(GREEN "\nmessage saved: %ld -> %ld" RESET, senderId, receiverId);
+
+                char pushPacket[BUFFER_SIZE];
+                snprintf(pushPacket, sizeof(pushPacket), "newMessage\x1E%ld\x1F%ld\x1F%s\x1F%s", messageId, senderId, parts[3], "now");
+
+                if (!pushToUser(receiverId, pushPacket)) {
+                    printf(YELLOW "\nreceiver %ld is offline, message saved to DB" RESET, receiverId);
+                }
             } else {
                 printf(RED "\nfailed to save message to db: %ld, %ld" RESET, senderId, messageId);
                 strcpy(response, "err");
@@ -310,13 +487,13 @@ void* acceptMessage(void *arg) {
         else if (strncmp(buffer, "createId/user", 13) == 0) {
             srand(time(nullptr) + clock());
             long id = rand()%2147483647;
-            sprintf(response, "createId/%ld", id);
+            sprintf(response, "createId/user/%ld", id);
             printf("\n" GREEN "newId generated for user: %ld" RESET, id);
         }
         else if (strncmp(buffer, "createId/message", 16) == 0) {
             srand(time(nullptr) + clock());
             long id = rand()%2147483647;
-            sprintf(response, "createId/%ld", id);
+            sprintf(response, "createId/message/%ld", id);
             printf("\n" GREEN "newId generated for message: %ld" RESET, id);
         }
         else if (strncmp(buffer, "save-profile/", 13) == 0) {
@@ -356,28 +533,65 @@ void* acceptMessage(void *arg) {
             continue;
         }
         else if (strncmp(buffer, "addFriend/", 10) == 0) {
+            printf(GREEN "\naddFriend received: %s" RESET, buffer);
+
             char *parts[2] = {0};
             int count = 0;
             char *token = strtok(buffer + 10, "\x1E");
-            while (token && count < 6) {
+            while (token && count < 2) {
                 parts[count++] = token;
                 token = strtok(nullptr, "\x1E");
             }
-            long senderId = strtol(parts[0], nullptr, 10);
-            long receiverId = strtol(parts[1], nullptr, 10);
-            sendFriendRequest(senderId, receiverId);
+
+            if (count == 2) {
+                long senderId = strtol(parts[0], nullptr, 10);
+                long receiverId = strtol(parts[1], nullptr, 10);
+
+                printf("\nparsed: sender=%ld, receiver=%ld", senderId, receiverId);
+
+                if (senderId > 0 && receiverId > 0) {
+                    if (sendFriendRequest(senderId, receiverId)) {
+                        printf(GREEN "\nзапрос в друзья отправлен %ld -> %ld" RESET, senderId, receiverId);
+                    } else {
+                        printf(RED "\nне удалось сохранить запрос" RESET);
+                    }
+                } else {
+                    printf(RED "\naddFriend: некорректные ID" RESET);
+                }
+            } else {
+                printf(RED "\naddFriend: плохой формат, получено %d частей" RESET, count);
+            }
         }
         else if (strncmp(buffer, "acceptFriend/", 13) == 0) {
             char *parts[2] = {0};
             int count = 0;
-            char *token = strtok(buffer + 10, "\x1E");
-            while (token && count < 6) {
+            char *token = strtok(buffer + 13, "\x1E");
+            while (token && count < 2) {
                 parts[count++] = token;
                 token = strtok(nullptr, "\x1E");
             }
-            long senderId = strtol(parts[1], nullptr, 10);
-            long receiverId = strtol(parts[0], nullptr, 10);
-            acceptFriendRequest(receiverId, senderId);
+
+            if (count == 2) {
+                long receiverId = strtol(parts[0], nullptr, 10);
+                long senderId   = strtol(parts[1], nullptr, 10);
+
+                if (acceptFriendRequest(receiverId, senderId)) {
+                    printf(GREEN "\n%ld принял заявку от %ld" RESET, receiverId, senderId);
+
+                    char friendsListCmd[64];
+                    snprintf(friendsListCmd, sizeof(friendsListCmd), "getFriendsList/%ld", receiverId);
+                } else {
+                    printf(RED "\nне получилось принять в друзья: %ld -> %ld" RESET, senderId, receiverId);
+                }
+            }
+        }
+        else if (strncmp(buffer, "updateClient/", 13) == 0) {
+            long userId = strtol(buffer + 13, nullptr, 10);
+            if (userId > 0) {
+                registerClient(userId, sock);
+                // TODO сделать норм ответ - done??
+                getClientUpdates(userId);
+            }
         }
 
         send(sock, response, strlen(response), 0);
@@ -432,6 +646,7 @@ int main(void) {
             "receiverId BIGINT UNSIGNED NOT NULL,"
             "message TEXT NOT NULL,"
             "sentAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "isRead BOOLEAN NOT NULL DEFAULT FALSE,"
             "FOREIGN KEY (senderId) REFERENCES users(userId),"
             "FOREIGN KEY (receiverId) REFERENCES users(userId)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"

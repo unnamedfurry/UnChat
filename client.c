@@ -52,16 +52,20 @@ typedef struct {
     long userId;
     char profileDescription[MAX_DESC+1];
     char avatarUrl[MAX_AVATAR+1];
+    int newMessageCount;
 } Friend;
 Friend friends[100] = {0};
 typedef struct {
-    char messageId[11];
+    long messageId;
+    long senderId;
+    long receiverId;
     char message[2049];
 } Message;
 Message messages[1000000] = {0};
 long randomId = 0L;
 bool finishedResponse = false;
 long currentFriendId = 0L;
+int messagesCount = 0;
 
 
 //
@@ -101,15 +105,15 @@ void* recieveMessage(void* arg) {
         if (strncmp(localBuf, "save-profile/", 13) == 0) {
             printf("\n" cGREEN "profile successfully saved on server" RESET);
         }
-        else if (strncmp(localBuf, "createId/user", 13) == 0) {
-            long newId = atol(localBuf + 13);   // исправил +9 → +13
+        else if (strncmp(localBuf, "createId/user/", 14) == 0) {
+            long newId = atol(localBuf + 14);
             if (newId > 0) {
                 config.userId = newId;
                 printf("\n" cGREEN "got new id for user: %ld" RESET, newId);
             }
         }
-        else if (strncmp(localBuf, "createId/message", 16) == 0) {
-            long newId = atol(localBuf + 16);
+        else if (strncmp(localBuf, "createId/message/", 17) == 0) {
+            long newId = atol(localBuf + 17);
             if (newId > 0) {
                 randomId = newId;
                 printf("\n" cGREEN "got new id for message: %ld" RESET, newId);
@@ -125,15 +129,15 @@ void* recieveMessage(void* arg) {
                 char *token2 = strtok(token, "\x1F");
                 while (token2 && count2 < 4) {
                     parts[count2++] = token2;
-                    token2 = strtok(NULL, "\x1F");
+                    token2 = strtok(nullptr, "\x1F");
                 }
                 Friend friend_;
 
-                // Защита от NULL
+                // protection from NULL
                 if (parts[0]) strcpy(friend_.name, parts[0]);
                 else friend_.name[0] = '\0';
 
-                friend_.userId = (parts[1]) ? strtol(parts[1], NULL, 10) : 0;
+                friend_.userId = (parts[1]) ? strtol(parts[1], nullptr, 10) : 0;
 
                 if (parts[2]) strcpy(friend_.profileDescription, parts[2]);
                 else friend_.profileDescription[0] = '\0';
@@ -144,7 +148,7 @@ void* recieveMessage(void* arg) {
                 friends[count] = friend_;
                 count++;
 
-                token = strtok(NULL, "\x1E");
+                token = strtok(nullptr, "\x1E");
             }
             printf("\n" cGREEN "received friends list (%d friends)" RESET, count);
         }
@@ -153,6 +157,112 @@ void* recieveMessage(void* arg) {
         }
         else if (strncmp(localBuf, "err", 3) == 0) {
             printf("\n" cRED "Server returned error" RESET);
+        }
+        else if (strncmp(localBuf, "newMessage\x1E", 11) == 0) {
+            printf(cGREEN "[NEW MESSAGE] Получено push-сообщение\n" RESET);
+
+            char *parts[4] = {0};
+            int cnt = 0;
+            char *token = strtok(localBuf + 11, "\x1F");
+
+            while (token && cnt < 4) {
+                parts[cnt++] = token;
+                token = strtok(nullptr, "\x1F");
+            }
+
+            if (cnt >= 3) {
+                long msgId     = strtol(parts[0], nullptr, 10);
+                long senderId  = strtol(parts[1], nullptr, 10);
+                const char *text = parts[2];
+                // const char *time = parts[3]; - may use later
+
+                // updating new message counter badge
+                for (int i = 0; i < 100; i++) {
+                    if (friends[i].userId == senderId) {
+                        friends[i].newMessageCount++;
+                        break;
+                    }
+                }
+
+                // if the chat is opened - adding to messages
+                if (currentFriendId == senderId) {
+                    if (messagesCount < 1000000) {
+                        messages[messagesCount].messageId = msgId;
+                        messages[messagesCount].senderId = senderId;
+                        messages[messagesCount].receiverId = config.userId;
+                        strncpy(messages[messagesCount].message, text, 2048);
+                        messagesCount++;
+                    }
+                }
+
+                printf(cGREEN "\nсообщение от %ld: %s" RESET, senderId, text);
+            }
+        }
+        else if (strncmp(localBuf, "newFriendRequest\x1E", 18) == 0) {
+            printf(cMAGENTA "\nновый запрос в друзья" RESET);
+
+            char *parts[5] = {0};
+            int cnt = 0;
+            char *token = strtok(localBuf + 18, "\x1F");
+            while (token && cnt < 5) {
+                parts[cnt++] = token;
+                token = strtok(nullptr, "\x1F");
+            }
+
+            if (cnt >= 4) {
+                long requestId = strtol(parts[0], nullptr, 10);
+                long senderId  = strtol(parts[1], nullptr, 10);
+                const char *username = parts[2];
+
+                printf(cMAGENTA "\nот %s (id %ld) пришла заявка в друзья" RESET, username, senderId);
+
+                // Можно добавить в отдельный массив или просто вывести уведомление
+                // Позже можно сделать попап с кнопками "Принять / Отклонить"
+            }
+        }
+        else if (strncmp(localBuf, "updateClient/messages", 21) == 0) {
+            printf(cGREEN "\n[UPDATE] новые сообщения" RESET);
+            char *ptr = localBuf + 21;
+
+            int totalNew = (int)strtol(ptr, &ptr, 10);
+            ptr = strchr(ptr, '\x1E');
+            if (!ptr) return NULL;
+            ptr++;  // getting right to the data while skipping header and \x1E
+
+            // clear old counters
+            for (int i = 0; i < 100; i++) {
+                friends[i].newMessageCount = 0;
+            }
+
+            char *token = strtok(ptr, "\x1E");
+            while (token) {
+                char *parts[2] = {0};
+                int c = 0;
+                char *t2 = strtok(token, "\x1F");
+                while (t2 && c < 2) {
+                    parts[c++] = t2;
+                    t2 = strtok(nullptr, "\x1F");
+                }
+
+                if (c == 2) {
+                    long senderId = strtol(parts[0], nullptr, 10);
+                    int count = atoi(parts[1]);
+
+                    for (int i = 0; i < 100; i++) {
+                        if (friends[i].userId == senderId) {
+                            friends[i].newMessageCount = count;
+                            break;
+                        }
+                    }
+                }
+                token = strtok(nullptr, "\x1E");
+            }
+
+            printf(cGREEN "\nобновление счётчика сообщений, всего новых: %d" RESET, totalNew);
+        }
+        else if (strncmp(localBuf, "updateClient/friendRequests", 27) == 0) {
+            printf(cGREEN "\nобновляем реквесты в друзья" RESET);
+
         }
 
         finishedResponse = true;
@@ -248,12 +358,20 @@ bool loadConfig(Config *cfg) {
             }
         }
         else if (strcmp(key, "avatarUrl") == 0) {
-            strncpy(cfg->avatarUrl, value, sizeof(cfg->avatarUrl)-1);
-            cfg->avatarUrl[sizeof(cfg->avatarUrl)-1] ='\0';
+            if (strcmp(value, "null") == 0) {
+                cfg->avatarUrl[0] = '\0';
+            } else {
+                strncpy(cfg->avatarUrl, value, sizeof(cfg->avatarUrl)-1);
+                cfg->avatarUrl[sizeof(cfg->avatarUrl)-1] = '\0';
+            }
         }
         else if (strcmp(key, "profileDescription") == 0) {
-            strncpy(cfg->profileDescription, value, sizeof(cfg->profileDescription)-1);
-            cfg->profileDescription[sizeof(cfg->profileDescription)-1] ='\0';
+            if (strcmp(value, "null") == 0) {
+                cfg->avatarUrl[0] = '\0';
+            } else {
+                strncpy(cfg->profileDescription, value, sizeof(cfg->profileDescription)-1);
+                cfg->profileDescription[sizeof(cfg->profileDescription)-1] ='\0';
+            }
         }
     }
     fclose(f);
@@ -275,8 +393,8 @@ bool saveConfig(Config *cfg) {
     }
     fprintf(f, "\n");
 
-    fprintf(f, "avatarUrl=%s\n", cfg->avatarUrl);
-    fprintf(f, "profileDescription=%s\n", cfg->profileDescription);
+    fprintf(f, "avatarUrl=%s\n", strlen(cfg->avatarUrl)==0 ? "null" : cfg->avatarUrl);
+    fprintf(f, "profileDescription=%s\n", strlen(cfg->profileDescription)==0 ? "null" : cfg->profileDescription);
     fclose(f);
 
     char hashHex[65] = {0};
@@ -287,9 +405,14 @@ bool saveConfig(Config *cfg) {
     char message[2048] = {0};
     snprintf(message, sizeof(message),
              "save-profile/%ld\x1E%s\x1E%s\x1E%s\x1E%s\x1E%s",
-             cfg->userId, cfg->userName, cfg->email, hashHex,
-             cfg->avatarUrl, cfg->profileDescription);
+             cfg->userId,
+             cfg->userName,
+             cfg->email,
+             hashHex,
+             cfg->avatarUrl,
+             cfg->profileDescription);
 
+    printf(cYELLOW "\nsave-profile: %s" RESET, message);
     sendMessage(message);
     return true;
 }
@@ -364,8 +487,6 @@ int main(void) {
     GuiSetStyle(DEFAULT, 16, 24);
 
     bool initedNetwork = initNetwork();
-    sendMessage("test/");
-
     bool loadedConf = loadConfig(&config);
     if (!loadedConf || config.isFirstUsed) {
         strcpy(config.userName, "");
@@ -377,6 +498,10 @@ int main(void) {
         sprintf(message, "getFriendsList/%ld/", config.userId);
         sendMessage(message);
     }
+    char msgBuf[BUFFER_SIZE];
+    snprintf(msgBuf, sizeof(msgBuf), "updateClient/%ld", config.userId);
+    sendMessage(msgBuf);
+
     char passwordInput[MAX_PASS+1] = {0};
     static int activeField=-1;
     char newDesc[1025] = "";
@@ -384,12 +509,19 @@ int main(void) {
     bool isAddingFriend = false;
     char userId[10] = "";
     static Texture2D userAvatarTexture = {0};
-    static char avatarPathInput[256] = {0};
+    static char avatarPathInput[512] = {0};
     if (strlen(config.avatarUrl) != 0) {
-        strncmp(avatarPathInput, config.avatarUrl, sizeof(config.avatarUrl));
-        Image img = LoadImage(avatarPathInput);
-        userAvatarTexture = LoadTextureFromImage(img);
-        UnloadImage(img);
+        ssize_t len = readlink("/proc/self/exe", avatarPathInput, 255);
+        if (len == -1) {
+            perror("readlink /proc/self/exe failed");
+            avatarPathInput[0] = '\0';
+        } else {
+            strncpy(avatarPathInput, config.avatarUrl, strlen(config.avatarUrl)+len);
+            Image img = LoadImage(avatarPathInput);
+            userAvatarTexture = LoadTextureFromImage(img);
+            UnloadImage(img);
+            printf("\n\ncurrent path: %s\n\n", avatarPathInput);
+        }
     }
 
     while (!WindowShouldClose()) {
@@ -423,10 +555,18 @@ int main(void) {
 
                 HashPassword(passwordInput, config.passwordHash);
                 config.isFirstUsed = false;
-                sendMessage("createId/user");
 
-                // awaiting for responce
-                sleep(1);        // or through flag
+                sendMessage("createId/user");
+                for (int i = 0; i < 500 && config.userId == 0; i++) {
+                    usleep(10000);
+                }
+                if (config.userId == 0) {
+                    printf(cRED "\nне получили ID от сервера, попробуй снова" RESET);
+                    config.isFirstUsed = true;
+                    continue;
+                }
+                strncpy(config.avatarUrl, "null", 4);
+                if (strlen(config.profileDescription)==0) strncpy(config.profileDescription, "null", 4);
 
                 saveConfig(&config);
             }
@@ -551,16 +691,40 @@ int main(void) {
                 if (GuiTextBox((Rectangle){1600/2-190, 900/2-140, 380, 60}, userId, 10, activeField==6)) {
                     activeField = (activeField == 6) ? -1 : 6;
                 }
-                if (GuiButton((Rectangle){1600/2+96, 900/2+156, 100, 40}, "Далее")) {
+                if (GuiButton((Rectangle){1600/2+66, 900/2+156, 130, 40}, "Отправить")) {
                     if (strlen(userId) == 0) continue;
-                    char parsed[21] = {0};
-                    snprintf(parsed, sizeof(parsed), "addFriend/%ld\x1E%s", config.userId, userId);
+
+                    long targetId = strtol(userId, nullptr, 10);
+                    if (targetId <= 0) {
+                        printf(cRED "\nнекорректный ID" RESET);
+                        continue;
+                    }
+
+                    char parsed[64] = {0};
+                    snprintf(parsed, sizeof(parsed), "addFriend/%ld\x1E%ld", config.userId, targetId);
+
+                    printf(cYELLOW "\nотправлен запрос в друзья: %s" RESET, parsed);
                     sendMessage(parsed);
-                    isAddingFriend=false;
+
+                    isAddingFriend = false;
+                }
+                if (GuiButton((Rectangle){1600/2-196, 900/2+156, 130, 40}, "Принять")) {
+                    if (strlen(userId) > 0) {
+                        long targetId = strtol(userId, nullptr, 10);
+                        if (targetId == 0) continue;
+                        char cmd[100];
+                        snprintf(cmd, sizeof(cmd), "acceptFriend/%ld\x1E%ld", config.userId, targetId);
+                        sendMessage(cmd);
+                        printf(cGREEN "\nпопытка принять заявку от %ld" RESET, targetId);
+
+                        char req[64];
+                        snprintf(req, sizeof(req), "getFriendsList/%ld", config.userId);
+                        sendMessage(req);
+                    }
                 }
             }
-            // TODO рендер друзей. нужно перебрать массив friends и отрисовать каждый слот в левой части.
-            int startY = 90;
+
+            float startY = 90.0f;
             for (int i = 0; i < 100 && friends[i].userId != 0; i++) {
                 Rectangle friendRect = { 10, startY, 280, 70 };
 
@@ -568,7 +732,8 @@ int main(void) {
                     DrawRectangleRec(friendRect, (Color){60, 60, 70, 255});
                     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
                         currentFriendId = friends[i].userId;
-                        // TODO: загрузить историю чата с этим другом
+                        messagesCount = 0;
+                        friends[i].newMessageCount = 0;
                     }
                 } else {
                     DrawRectangleRec(friendRect, (Color){50, 50, 60, 255});
@@ -576,12 +741,23 @@ int main(void) {
                 DrawRectangleLinesEx(friendRect, 2, GRAY);
 
                 // friend avatar
-                Rectangle avatarRect = { 20, startY + 8, 54, 54 };
-                DrawRectangleRec(avatarRect, DARKGRAY);
-                DrawRectangleLinesEx(avatarRect, 2, LIGHTGRAY);
+                Rectangle avatarRect2 = { 20, startY + 8, 54, 54 };
+                DrawRectangleRec(avatarRect2, DARKGRAY);
+                DrawRectangleLinesEx(avatarRect2, 2, LIGHTGRAY);
 
                 // name + description
                 DrawTextEx(font, friends[i].name, (Vector2){85, startY + 12}, 24, 2, WHITE);
+
+                if (friends[i].newMessageCount > 0) {
+                    char badge[16];
+                    snprintf(badge, sizeof(badge), "%d", friends[i].newMessageCount);
+
+                    int textW = MeasureText(badge, 20);
+                    Rectangle badgeRect = {240, startY + 12, (float)textW + 12, 24};
+
+                    DrawRectangleRec(badgeRect, RED);
+                    DrawText(badge, (int)badgeRect.x + 6, (int)badgeRect.y + 4, 20, WHITE);
+                }
 
                 if (strlen(friends[i].profileDescription) > 0) {
                     char shortDesc[80];
@@ -594,8 +770,55 @@ int main(void) {
                 startY += 80;
             }
 
+            // chat
+            Rectangle chatArea = {310, 80, 980, 700};
 
-            // TODO сделать группы
+            //DrawRectangleRec(chatArea, (Color){35, 35, 45, 255});
+            //DrawRectangleLinesEx(chatArea, 2, GRAY);
+
+            // chat header
+            if (currentFriendId != 0) {
+                char *friendName = "Неизвестный";
+                for (int k=0; k<100; k++) {
+                    if (friends[k].userId == currentFriendId) {
+                        friendName = friends[k].name;
+                        break;
+                    }
+                }
+                DrawTextEx(font, TextFormat("Чат с %s", friendName), (Vector2){330, 90}, 28, 2, WHITE);
+            }
+
+            // Рендер сообщений
+            int msgY = 140;
+            for (int k=0; k<messagesCount && k<1000; k++) {   // messagesCount нужно завести
+                Message *m = &messages[k];
+
+                int textWidth = MeasureTextEx(font, m->message, 22, 2).x;
+                int bubbleWidth = textWidth + 40;
+
+                Rectangle bubble = {
+                    (chatArea.x + chatArea.width - bubbleWidth - 30),
+                    msgY,
+                    bubbleWidth,
+                    50
+                };
+
+                // block color
+                Color bubbleColor = (Color){0, 120, 215, 255};
+                DrawRectangleRec(bubble, bubbleColor);
+                DrawRectangleLinesEx(bubble, 2, LIGHTGRAY);
+
+                // message color
+                DrawTextEx(font, m->message,
+                (Vector2){bubble.x + 20, bubble.y + 12},
+                22, 2, WHITE);
+
+                msgY += 70;
+            }
+            endChat: ;
+
+
+            // TODO сделать группы - отложено до версии 2.0
         }
 
         if (initedNetwork == false) {
