@@ -122,6 +122,7 @@ void* recieveMessage(void* arg) {
         else if (strncmp(localBuf, "getFriendsList/", 15) == 0) {
             int count = 0;
             char *token = strtok(localBuf + 15, "\x1E");
+            token = strtok(nullptr, "\x1E");
 
             while (token && count < 100) {
                 char *parts[4] = {0};
@@ -773,9 +774,6 @@ int main(void) {
             // chat
             Rectangle chatArea = {310, 80, 980, 700};
 
-            //DrawRectangleRec(chatArea, (Color){35, 35, 45, 255});
-            //DrawRectangleLinesEx(chatArea, 2, GRAY);
-
             // chat header
             if (currentFriendId != 0) {
                 char *friendName = "Неизвестный";
@@ -785,33 +783,30 @@ int main(void) {
                         break;
                     }
                 }
-                DrawTextEx(font, TextFormat("Чат с %s", friendName), (Vector2){330, 90}, 28, 2, WHITE);
+                DrawTextEx(font, TextFormat("Чат с %s", friendName), (Vector2){330, 50}, 28, 2, WHITE);
             }
 
-            // Рендер сообщений
             int msgY = 140;
-            for (int k=0; k<messagesCount && k<1000; k++) {   // messagesCount нужно завести
-                Message *m = &messages[k];
+            for (int i=0; i<messagesCount && i<1000; i++) {
+                Message *m = &messages[i];
 
                 int textWidth = MeasureTextEx(font, m->message, 22, 2).x;
                 int bubbleWidth = textWidth + 40;
 
                 Rectangle bubble = {
-                    (chatArea.x + chatArea.width - bubbleWidth - 30),
+                    (chatArea.x + 30),
                     msgY,
                     bubbleWidth,
                     50
                 };
 
-                // block color
-                Color bubbleColor = (Color){0, 120, 215, 255};
+                Color bubbleColor = (Color){60, 60, 70, 255};
                 DrawRectangleRec(bubble, bubbleColor);
                 DrawRectangleLinesEx(bubble, 2, LIGHTGRAY);
 
-                // message color
                 DrawTextEx(font, m->message,
-                (Vector2){bubble.x + 20, bubble.y + 12},
-                22, 2, WHITE);
+                           (Vector2){bubble.x + 20, bubble.y + 12},
+                           22, 2, WHITE);
 
                 msgY += 70;
             }
