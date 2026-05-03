@@ -26,7 +26,7 @@
 #define BWHITE  "\033[1;37m"
 
 int port = 63321;
-#define BUFFER_SIZE 2077
+#define BUFFER_SIZE 7097
 int server_fd, new_socket;
 struct sockaddr_in address;
 int addrlen = sizeof(address);
@@ -179,6 +179,7 @@ void getClientUpdates(long userId) {
         } else {
             offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0\x1E");
         }
+        serverResponse[++offset] = '\0';
         pushToUser(userId, serverResponse);
         free(serverResponse);
     }
@@ -214,7 +215,7 @@ void getClientUpdates(long userId) {
                 mysql_free_result(res);
 
                 int tempOffset = snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "%s", message);
-                if (tempOffset > size) {
+                if (tempOffset+offset > size) {
                     size+=2560;
                     char *newServerResponce = realloc(serverResponse, size);
                     if (newServerResponce) {
@@ -229,9 +230,71 @@ void getClientUpdates(long userId) {
         } else {
             offset += snprintf(serverResponse+offset, sizeof(serverResponse)-offset, "0");
         }
+        serverResponse[++offset] = '\0';
         pushToUser(userId, serverResponse);
         free(serverResponse);
     }
+}
+
+void getChatHistory(long userId, long friendId, int sock) {
+    int bufSize = BUFFER_SIZE;
+    char *response = malloc(bufSize);
+    if (!response) { printf(RED "\nnot enough memory for answer." RESET); return;}
+    int offset = snprintf(response, bufSize, "getChatHistory/%ld\x1E", friendId);
+
+    char query[512];
+    snprintf(query, sizeof(query),
+        "SELECT messageId, senderId, message, sentAt "
+        "FROM messages "
+        "WHERE (senderId = %ld AND receiverId = %ld) "
+           "OR (senderId = %ld AND receiverId = %ld) "
+        "ORDER BY sentAt ASC LIMIT 500",
+        userId, friendId, friendId, userId);
+
+    if (mysql_query(conn, query)) {
+        response[++offset] = '\0';
+        send(sock, "getChatHistory/error", 20, 0);
+        free(response);
+        return;
+    }
+
+    MYSQL_RES *res = mysql_store_result(conn);
+    if (!res) {
+        response[++offset] = '\0';
+        send(sock, "getChatHistory/empty", 21, 0);
+        free(response);
+        return;
+    }
+
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (offset+1024 > bufSize) {
+            bufSize+=BUFFER_SIZE;
+            char *newResponse = realloc(response, bufSize);
+            if (!newResponse) { printf(RED "\nnot enough memory for answer" RESET); free(response); break; }
+            response = newResponse;
+        }
+        long msgId = strtol(row[0], nullptr, 10);
+        long sender = strtol(row[1], nullptr, 10);
+        const char *text = row[2] ? row[2] : "null";
+
+        offset += snprintf(response+offset, bufSize-offset,
+            "%ld\x1F%ld\x1F%s\x1E",
+            msgId, sender, text);
+    }
+
+    mysql_free_result(res);
+
+    if (offset > 20) {
+        response[++offset] = '\0';
+        send(sock, response, strlen(response), 0);
+        printf(GREEN "\n[getChatHistory] sent %zu bytes for %ld <-> %ld" RESET, strlen(response), userId, friendId);
+    } else {
+        response[++offset] = '\0';
+        send(sock, "getChatHistory/empty", 21, 0);
+    }
+
+    free(response);
 }
 
 bool saveUserToDB(long userId, const char *username, const char *email,
@@ -314,12 +377,14 @@ void getFriends(long user_id, int sock) {
 
     if (mysql_query(conn, query)) {
         printf(RED "\ngetFriends: failed to query friends for user %ld" RESET, user_id);
+        response[++offset] = '\0';
         send(sock, "getFriendsList/error", 21, 0);
         return;
     }
 
     MYSQL_RES *res = mysql_store_result(conn);
     if (res == NULL) {
+        response[++offset] = '\0';
         send(sock, "getFriendsList/empty", 21, 0);
         return;
     }
@@ -328,7 +393,7 @@ void getFriends(long user_id, int sock) {
     while ((row = mysql_fetch_row(res))) {
         if (row[0] == NULL) continue;
 
-        long friend_id = strtol(row[0], NULL, 10);
+        long friend_id = strtol(row[0], nullptr, 10);
         if (friend_id <= 0) continue;
 
         // requesting data
@@ -356,9 +421,11 @@ void getFriends(long user_id, int sock) {
 
     // sending result
     if (offset > 15) {   // if there is atleast one friend
+        response[++offset] = '\0';
         send(sock, response, strlen(response), 0);
         printf(GREEN "\ngetFriends: sent %zu bytes for user %ld" RESET, strlen(response), user_id);
     } else {
+        response[++offset] = '\0';
         send(sock, "getFriendsList/empty", 21, 0);
     }
 }
@@ -589,9 +656,27 @@ void* acceptMessage(void *arg) {
             long userId = strtol(buffer + 13, nullptr, 10);
             if (userId > 0) {
                 registerClient(userId, sock);
-                // TODO сделать норм ответ - done??
                 getClientUpdates(userId);
             }
+        }
+        else if (strncmp(buffer, "getChatHistory/", 15) == 0) {
+            char *parts[2] = {0};
+            int count = 0;
+            char *token = strtok(buffer + 15, "\x1E");
+            while (token && count < 2) {
+                parts[count++] = token;
+                token = strtok(nullptr, "\x1E");
+            }
+
+            if (count == 2) {
+                long userId = strtol(parts[0], nullptr, 10);
+                long friendId = strtol(parts[1], nullptr, 10);
+
+                if (userId > 0 && friendId > 0) {
+                    getChatHistory(userId, friendId, sock);
+                }
+            }
+            continue;
         }
 
         send(sock, response, strlen(response), 0);

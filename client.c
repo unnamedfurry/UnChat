@@ -75,12 +75,11 @@ int messagesCount = 0;
 
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 63321
-#define BUFFER_SIZE 2077
+#define BUFFER_SIZE 7097
 static pthread_t thread_id;
 static int sock = -1;
 static struct sockaddr_in serv_addr;
 bool connected = false;
-char buf[BUFFER_SIZE];
 
 void* recieveMessage(void* arg) {
     char localBuf[BUFFER_SIZE];
@@ -98,9 +97,6 @@ void* recieveMessage(void* arg) {
         localBuf[answerByte] = '\0';
 
         printf("\n" cYELLOW "got from server: %s" RESET, localBuf);
-
-        strncpy(buf, localBuf, sizeof(buf)-1);
-        buf[sizeof(buf)-1] = '\0';
 
         if (strncmp(localBuf, "save-profile/", 13) == 0) {
             printf("\n" cGREEN "profile successfully saved on server" RESET);
@@ -125,9 +121,13 @@ void* recieveMessage(void* arg) {
             token = strtok(nullptr, "\x1E");
 
             while (token && count < 100) {
+                char tokenCopy[BUFFER_SIZE];
+                strncpy(tokenCopy, token, sizeof(tokenCopy)-1);
+                tokenCopy[sizeof(tokenCopy)-1] = '\0';
+
                 char *parts[4] = {0};
                 int count2 = 0;
-                char *token2 = strtok(token, "\x1F");
+                char *token2 = strtok(tokenCopy, "\x1F");
                 while (token2 && count2 < 4) {
                     parts[count2++] = token2;
                     token2 = strtok(nullptr, "\x1F");
@@ -154,7 +154,83 @@ void* recieveMessage(void* arg) {
             printf("\n" cGREEN "received friends list (%d friends)" RESET, count);
         }
         else if (strncmp(localBuf, "getChatHistory/", 15) == 0) {
-            // TODO
+            char *dataStart = strchr(localBuf + 15, '\x1E');
+            if (!dataStart) {
+                printf(cYELLOW "\ngetChatHistory: история пуста" RESET);
+                messagesCount = 0;
+                currentFriendId = strtol(localBuf + 15, nullptr, 10);
+                return NULL;
+            }
+
+            dataStart++;
+            long friendId = strtol(localBuf + 15, nullptr, 10);
+
+            // copy all at a time
+            size_t dataLen = strlen(dataStart) + 1;
+            char *dataCopy = malloc(dataLen);
+            if (!dataCopy) return NULL;
+
+            memcpy(dataCopy, dataStart, dataLen);
+
+            messagesCount = 0;
+            int loaded = 0;
+
+            char *p = dataCopy;
+
+            while (p && *p && messagesCount < 999999) {
+                // locating the end of the block
+                char *record_end = strchr(p, '\x1E');
+                if (record_end) *record_end = '\0';   // temporary cutting
+
+                if (strlen(p) > 0) {
+                    char *q = p;
+
+                    // parsing three parts through \x1F
+                    char *part1 = q;
+                    char *part2 = strchr(q, '\x1F');
+                    char *part3 = nullptr;
+                    if (part2) {
+                        *part2 = '\0';
+                        q = part2 + 1;
+
+                        part3 = strchr(q, '\x1F');
+                        if (part3) {
+                            *part3 = '\0';
+                            q = part3 + 1;           // part3 is now our text
+                        } else {
+                            q = nullptr;
+                        }
+                    } else {
+                        q = nullptr;
+                    }
+
+                    if (part1 && part2 && part3 && strlen(q) > 0 && !strstr(q, "null")) {
+                        messages[messagesCount].messageId = strtol(part1, nullptr, 10);
+                        messages[messagesCount].senderId  = strtol(part2 + 1, nullptr, 10);  // +1 bc of \x1F
+                        messages[messagesCount].receiverId =
+                            (messages[messagesCount].senderId == config.userId) ? friendId : config.userId;
+
+                        strncpy(messages[messagesCount].message, q, 2048);
+                        messages[messagesCount].message[2049] = '\0';
+
+                        messagesCount++;
+                        loaded++;
+                    }
+
+                }
+                // jumping to next block
+                if (record_end) {
+                    *record_end = '\x1E';   // restoring
+                    p = record_end + 1;
+                } else {
+                    p = nullptr;
+                }
+            }
+
+            free(dataCopy);
+            currentFriendId = friendId;
+
+            printf(cGREEN "\nзагружено %d сообщений с %ld" RESET, loaded, friendId);
         }
         else if (strncmp(localBuf, "err", 3) == 0) {
             printf("\n" cRED "Server returned error" RESET);
@@ -673,6 +749,13 @@ int main(void) {
                     snprintf(parsed, sizeof(parsed), "receive-message/%ld\x1E%ld\x1E%ld\x1E%s", randomId, config.userId, currentFriendId, message);
 
                     sendMessage(parsed);
+                    if (messagesCount < 1000000) {
+                        messages[messagesCount].messageId = randomId;
+                        messages[messagesCount].senderId = config.userId;
+                        messages[messagesCount].receiverId = currentFriendId;
+                        strncpy(messages[messagesCount].message, message, 2048);
+                        messagesCount++;
+                    }
                     memset(message, 0, sizeof(message));
                     memset(parsed, 0, strlen(parsed));
                 }
@@ -735,6 +818,10 @@ int main(void) {
                         currentFriendId = friends[i].userId;
                         messagesCount = 0;
                         friends[i].newMessageCount = 0;
+
+                        char req[64];
+                        snprintf(req, sizeof(req), "getChatHistory/%ld\x1E%ld", config.userId, currentFriendId);
+                        sendMessage(req);
                     }
                 } else {
                     DrawRectangleRec(friendRect, (Color){50, 50, 60, 255});
@@ -786,23 +873,25 @@ int main(void) {
                 DrawTextEx(font, TextFormat("Чат с %s", friendName), (Vector2){330, 50}, 28, 2, WHITE);
             }
 
-            int msgY = 140;
-            for (int i=0; i<messagesCount && i<1000; i++) {
+            int msgY = 100;
+            for (int i=0; i<messagesCount; i++) {
                 Message *m = &messages[i];
+
+                bool isMine = (m->senderId == config.userId);
 
                 int textWidth = MeasureTextEx(font, m->message, 22, 2).x;
                 int bubbleWidth = textWidth + 40;
 
                 Rectangle bubble = {
-                    (chatArea.x + 30),
+                    isMine ? (chatArea.x + chatArea.width - bubbleWidth - 30) : (chatArea.x + 30),
                     msgY,
                     bubbleWidth,
                     50
                 };
 
-                Color bubbleColor = (Color){60, 60, 70, 255};
+                Color bubbleColor = isMine ? (Color){0, 120, 215, 255} : (Color){60, 60, 70, 255};
                 DrawRectangleRec(bubble, bubbleColor);
-                DrawRectangleLinesEx(bubble, 2, LIGHTGRAY);
+                DrawRectangleLinesEx(bubble, 2, isMine ? SKYBLUE : LIGHTGRAY);
 
                 DrawTextEx(font, m->message,
                            (Vector2){bubble.x + 20, bubble.y + 12},
